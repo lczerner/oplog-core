@@ -127,6 +127,17 @@ export class Engine {
     this.result = this.replayer.result();
   }
 
+  /**
+   * Runs scans, writes, checkpoints and cache imports 1 at a time. 2 writes at the same time
+   * would both link to the same own last op: a fork that stops the own chain (ADR 0014).
+   */
+  private queue: Promise<unknown> = Promise.resolve();
+  private serial<T>(f: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(f, f);
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
   get state() {
     return this.result.state;
   }
@@ -179,7 +190,11 @@ export class Engine {
    * (cheap, for polling). New authors and large gaps need a full scan.
    * Returns true if something new was found.
    */
-  async scan(mode: 'full' | 'quick' = 'full'): Promise<boolean> {
+  scan(mode: 'full' | 'quick' = 'full'): Promise<boolean> {
+    return this.serial(() => this.scanInner(mode));
+  }
+
+  private async scanInner(mode: 'full' | 'quick'): Promise<boolean> {
     const before = this.ops.size;
     const issuesBefore = this.fileIssues.size;
     if (mode === 'full' || !this.trustRoot) await this.loadTrustRoot();
@@ -362,7 +377,11 @@ export class Engine {
    * A client never reads a known file again during normal scans. So a file that
    * someone changed or deleted after the first read is only found by this full check.
    */
-  async reverifyAll(): Promise<void> {
+  reverifyAll(): Promise<void> {
+    return this.serial(() => this.reverifyInner());
+  }
+
+  private async reverifyInner(): Promise<void> {
     this.ops.clear();
     this.heads_.clear();
     this.appliedHashes.clear();
@@ -378,7 +397,7 @@ export class Engine {
     this.usedPacks.clear();
     this.checkpointInfo.clear();
     this.pendingCheckpoints = [];
-    await this.scan('full');
+    await this.scanInner('full');
   }
 
   // ---- Verify + replay ---------------------------------------------------------------------
@@ -543,7 +562,11 @@ export class Engine {
    * Throws AuthError if the op is rejected, and SupersededError if it would have
    * no effect because of the current state (unless allowSuperseded is true).
    */
-  async write(signer: Signer, scope: string, type: string, payload: Record<string, unknown>, opts: { allowSuperseded?: boolean } = {}): Promise<Envelope> {
+  write(signer: Signer, scope: string, type: string, payload: Record<string, unknown>, opts: { allowSuperseded?: boolean } = {}): Promise<Envelope> {
+    return this.serial(() => this.writeInner(signer, scope, type, payload, opts));
+  }
+
+  private async writeInner(signer: Signer, scope: string, type: string, payload: Record<string, unknown>, opts: { allowSuperseded?: boolean }): Promise<Envelope> {
     // Keys that this op registers must be known before the check (else GrantUser/AddKey look invalid).
     await this.keys.addFromOps([{ type, payload } as Envelope], this.domain);
     const r = this.check(signer.keyId, scope, type, payload);
@@ -612,7 +635,11 @@ export class Engine {
   // ---- Checkpoints ----------------------------------------------------------------------------
 
   /** Writes a pack of all valid ops of a scope (admins only). */
-  async createCheckpoint(signer: Signer, scope: string): Promise<string> {
+  createCheckpoint(signer: Signer, scope: string): Promise<string> {
+    return this.serial(() => this.checkpointInner(signer, scope));
+  }
+
+  private async checkpointInner(signer: Signer, scope: string): Promise<string> {
     const owner = this.domain.keyOwner(this.state, signer.keyId);
     if (owner === null || !this.domain.isAdmin(this.state, owner)) throw new AuthError('only an admin can write a checkpoint');
     const valid = this.result.audit.filter((a) => a.scope === scope).map((a) => a.hash);
@@ -675,7 +702,11 @@ export class Engine {
   }
 
   /** Restores a cache. The cache must come from a trusted, integrity-protected store. */
-  async importCache(c: EngineCache): Promise<void> {
+  importCache(c: EngineCache): Promise<void> {
+    return this.serial(() => this.importInner(c));
+  }
+
+  private async importInner(c: EngineCache): Promise<void> {
     if (c?.v !== 2) return;
     for (const o of c.ops)
       if (!this.ops.has(o.path)) {

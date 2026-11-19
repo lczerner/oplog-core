@@ -148,3 +148,23 @@ describe('engine', () => {
     expect(admin.engine.audit[admin.engine.audit.length - 1].status).toBe('applied');
   });
 });
+
+describe('concurrency', () => {
+  it('parallel writes of 1 engine make a valid chain, not a fork', async () => {
+    const { storage, user } = await world();
+    await Promise.all(Array.from({ length: 8 }, (_, i) => user.engine.write(user.signer, 'data', 'CreateNote', { id: `p${i}`, text: 'x' })));
+    const fresh = new Engine(storage, notesDomain);
+    await fresh.scan();
+    expect(fresh.issues).toEqual([]);
+    for (let i = 0; i < 8; i++) expect(note(fresh.state, `p${i}`)).toBeDefined();
+  });
+
+  it('a write and a scan at the same time do not disturb each other', async () => {
+    const { storage, user, admin } = await world();
+    await Promise.all([user.engine.write(user.signer, 'data', 'CreateNote', { id: 'a', text: 'x' }), user.engine.scan(), user.engine.write(user.signer, 'data', 'CreateNote', { id: 'b', text: 'y' }), user.engine.scan('quick')]);
+    await admin.engine.scan();
+    expect(admin.engine.issues).toEqual([]);
+    expect(note(admin.engine.state, 'b')).toBeDefined();
+    void storage;
+  });
+});
