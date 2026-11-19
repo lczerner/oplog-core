@@ -1,0 +1,25 @@
+{
+  "name": "oplog-core",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Signed, immutable op log on a shared folder: canonical JSON, Ed25519, HLC, hash chains, deterministic replay with an app domain",
+  "exports": {
+    ".": "./src/index.ts",
+    "./node-fs": "./src/storage/node-fs.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "fast-check": "^4.10.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
