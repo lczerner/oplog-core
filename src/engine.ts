@@ -66,6 +66,9 @@ export interface EngineCache {
   sigOk: string[];
 }
 
+/** Numbers that a quick scan tries after a missing number. */
+const QUICK_LOOKAHEAD = 16;
+
 /** File names that the scan may read. The storage adapters refuse "\\" and ":". */
 const SAFE_NAME_RE = /^[^\\:/]+$/;
 
@@ -79,6 +82,10 @@ export class Engine {
   trustRoot: TrustRoot | null = null;
   private ops = new Map<string, KnownOp>(); // path → op
   private heads_ = new Map<string, { scope: string; keyId: string; seq: number; hash: string }>(); // scope|keyId → highest known op
+  /** scope|keyId → the validly signed op with the highest seq (for the writer). */
+  private lastSigned = new Map<string, KnownOp>();
+  /** scope|keyId → the last op of the valid chain. */
+  private chainHeads = new Map<string, { seq: number; hash: string }>();
   private forkCandidates = new Map<string, KnownOp>(); // conflict-copy path → op with a seq that has a main file
   private fileIssues = new Map<string, Issue>(); // path → issue (unknown / unparsable files)
   private sigStatus = new Map<string, SigStatus>(); // op hash → ok | bad
@@ -88,6 +95,8 @@ export class Engine {
   private packedPaths = new Set<string>();
   /** Checkpoint path → result of the pack signature check. */
   private cpSigOk = new Map<string, boolean>();
+  /** Checkpoint paths whose ops the engine used (trusted when read). Only these count in checkpointStats. */
+  private usedPacks = new Set<string>();
   /** Op path → issue: a trusted pack had a bad version of this op. */
   private packIssues = new Map<string, Issue>();
   /** Checkpoint path → its scope, time and the op paths in it (for the statistics only). */
@@ -166,7 +175,8 @@ export class Engine {
 
   /**
    * full = list all folders (finds new authors and unknown files).
-   * quick = only try the next seq of each known author (cheap, for polling).
+   * quick = read forward from the valid head of each known author, with a look-ahead after a gap
+   * (cheap, for polling). New authors and large gaps need a full scan.
    * Returns true if something new was found.
    */
   async scan(mode: 'full' | 'quick' = 'full'): Promise<boolean> {
@@ -174,7 +184,10 @@ export class Engine {
     const issuesBefore = this.fileIssues.size;
     if (mode === 'full' || !this.trustRoot) await this.loadTrustRoot();
     if (mode === 'quick') {
-      for (const { scope, keyId, seq } of this.heads()) await this.readForward(scope, keyId, seq + 1);
+      // Read forward from the head of each valid chain. Numbers that this client knows (also files
+      // with an issue) are skipped, so a known gap does not stop the scan. A full scan lists the folders.
+      const starts = new Map(this.validHeads().map((h) => [`${h.scope}|${h.keyId}`, h.seq]));
+      for (const { scope, keyId } of this.heads()) await this.readForward(scope, keyId, (starts.get(`${scope}|${keyId}`) ?? 0) + 1);
     } else {
       const found = await this.domain.discoverScopes(this.storage);
       this.missing = found.missing;
@@ -183,9 +196,10 @@ export class Engine {
       for (let i = 0; i < found.scopes.length; i++) {
         const n = this.ops.size;
         await this.scanScope(found.scopes[i]);
-        // Replay what this scope added before the next scope: then the packs of the next scope
-        // can be checked against the admins of the earlier scopes (for example "roles").
-        if (i < found.scopes.length - 1 && this.ops.size !== n) await this.recompute();
+        // Replay after the FIRST scope only (the users and admins): then the packs of the later
+        // scopes are checked against all admins. The trust decision needs no other scope, and a
+        // replay after each scope would cost O(scopes × ops).
+        if (i === 0 && found.scopes.length > 1 && this.ops.size !== n) await this.recompute();
       }
     }
     if (this.ops.size !== before || this.fileIssues.size !== issuesBefore || mode === 'full') {
@@ -245,11 +259,18 @@ export class Engine {
     }
   }
 
+  /**
+   * Reads forward from seq. Known numbers are skipped. After a missing number it also tries the
+   * next QUICK_LOOKAHEAD numbers, because a gap (chain format 2) can come from files of another
+   * person. A larger gap waits for the next full scan.
+   */
   private async readForward(scope: string, keyId: string, seq: number): Promise<void> {
-    for (let s = seq; ; s++) {
+    let missing = 0;
+    for (let s = seq; missing <= QUICK_LOOKAHEAD; s++) {
       const path = this.path(scope, 'ops', keyId, s);
-      if (this.ops.has(path)) continue;
-      if (!(await this.readOp(path))) return;
+      if (this.ops.has(path) || this.fileIssues.has(path)) continue;
+      if (await this.readOp(path)) missing = 0;
+      else missing++;
     }
   }
 
@@ -287,6 +308,7 @@ export class Engine {
     // Use the ops of a pack only if an admin signed it (known now). Else the scan reads the op files:
     // a pack that nobody can check must not hide or replace real files.
     if (!(await this.packTrusted(cp))) return;
+    this.usedPacks.add(path);
     for (const env of cp.ops) {
       if (env?.scope !== cp.scope || typeof env.authorKeyId !== 'string' || !KEY_ID_RE.test(env.authorKeyId) || !Number.isSafeInteger(env.seq) || env.seq < 1) continue;
       const p = this.path(env.scope, 'ops', env.authorKeyId, env.seq);
@@ -353,6 +375,7 @@ export class Engine {
     this.packedPaths.clear();
     this.cpSigOk.clear();
     this.packIssues.clear();
+    this.usedPacks.clear();
     this.checkpointInfo.clear();
     this.pendingCheckpoints = [];
     await this.scan('full');
@@ -402,6 +425,14 @@ export class Engine {
       if (s === 'ok') entries.push({ path, env: o.env, hash: o.hash, sig: s });
     }
     const chains = checkChains(entries);
+    this.chainHeads = chains.heads;
+    this.lastSigned = new Map();
+    for (const o of this.ops.values()) {
+      if (this.sigStatus.get(o.hash) !== 'ok') continue;
+      const k = `${o.env.scope}|${o.env.authorKeyId}`;
+      const cur = this.lastSigned.get(k);
+      if (!cur || o.env.seq > cur.env.seq) this.lastSigned.set(k, o);
+    }
     // Incremental apply if it gives the same result as a full replay: same trust
     // root, no op became invalid, no new revocation, and all new ops sort after
     // the last applied op. Otherwise: full replay (always correct).
@@ -465,8 +496,24 @@ export class Engine {
 
   // ---- Write ---------------------------------------------------------------------------------
 
+  /**
+   * The own last op of a key in a scope: the validly signed op with the highest seq.
+   * Files with a bad signature in the own folder (for example garbage of another person) do not count.
+   */
+  private ownLast(scope: string, keyId: string): KnownOp | null {
+    return this.lastSigned.get(`${scope}|${keyId}`) ?? null;
+  }
+
+  /** The last op of each valid chain (signature and chain checked). Use it for cutoffs and checkpoint frontiers. */
+  validHeads(): { scope: string; keyId: string; seq: number; hash: string }[] {
+    return [...this.chainHeads].map(([k, h]) => {
+      const i = k.indexOf('|');
+      return { scope: k.slice(0, i), keyId: k.slice(i + 1), seq: h.seq, hash: h.hash };
+    });
+  }
+
   private nextSeq(scope: string, keyId: string): number {
-    return (this.heads_.get(`${scope}|${keyId}`)?.seq ?? 0) + 1;
+    return (this.ownLast(scope, keyId)?.env.seq ?? 0) + 1;
   }
 
   /**
@@ -497,27 +544,39 @@ export class Engine {
    * no effect because of the current state (unless allowSuperseded is true).
    */
   async write(signer: Signer, scope: string, type: string, payload: Record<string, unknown>, opts: { allowSuperseded?: boolean } = {}): Promise<Envelope> {
+    // Keys that this op registers must be known before the check (else GrantUser/AddKey look invalid).
+    await this.keys.addFromOps([{ type, payload } as Envelope], this.domain);
     const r = this.check(signer.keyId, scope, type, payload);
     if (r.status === 'rejected') throw new AuthError(r.reason ?? 'rejected');
     if (r.status === 'superseded' && !opts.allowSuperseded) throw new SupersededError(r.reason ?? 'superseded');
     for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) {
-        // The seq was taken (for example by the same key in another tab or PC): read the files of this author.
-        const dir = `${this.domain.scopeDir(scope)}/ops/${signer.keyId}`;
-        for (const f of (await this.storage.list(dir)) ?? []) {
-          const p = `${dir}/${f.name}`;
-          if (OP_FILE_RE.test(f.name) && !this.ops.has(p)) await this.readOp(p);
+      // The numbers that files in the own folder use (valid or not). A file of another person
+      // under the next number must not block this author (chain format 2, mytasker Q-24).
+      const dir = `${this.domain.scopeDir(scope)}/ops/${signer.keyId}`;
+      const taken = new Set<number>();
+      let fresh = false;
+      for (const f of (await this.storage.list(dir)) ?? []) {
+        const m = OP_FILE_RE.exec(f.name);
+        if (!m) continue;
+        taken.add(Number(m[1]));
+        // Read unknown files of this author first (for example of the same key in another tab or PC):
+        // the own last op must be known, else the new op would make a fork.
+        // Also read again a file with an issue above the own last op: it can be a partial read of an
+        // own op from another tab or PC (then a write without it would make a fork).
+        const p = `${dir}/${f.name}`;
+        const above = Number(m[1]) > (this.ownLast(scope, signer.keyId)?.env.seq ?? 0);
+        if (!this.ops.has(p) && (!this.fileIssues.has(p) || above)) {
+          await this.readOp(p);
+          fresh = true;
         }
       }
-      const seq = this.nextSeq(scope, signer.keyId);
-      let prevHash: string | null = null;
-      if (seq > 1) {
-        const prev = this.ops.get(this.path(scope, 'ops', signer.keyId, seq - 1));
-        if (!prev) throw new Error(`own op ${seq - 1} in ${scope} is not readable. Ask an admin.`);
-        prevHash = prev.hash;
-      }
+      if (fresh) await this.recompute();
+      const last = this.ownLast(scope, signer.keyId);
+      let seq = (last?.env.seq ?? 0) + 1;
+      while (taken.has(seq)) seq++;
+      const prevHash = last?.hash ?? null;
       // The clock observed the valid ops in recompute(). Also observe the own last op, so that the chain HLC increases.
-      if (seq > 1) this.clock.observe(this.ops.get(this.path(scope, 'ops', signer.keyId, seq - 1))!.env.hlc);
+      if (last) this.clock.observe(last.env.hlc);
       const hlc = this.clock.tick();
       const u: UnsignedEnvelope = {
         v: 1,
@@ -560,7 +619,7 @@ export class Engine {
     const byHash = new Map([...this.ops.values()].map((o) => [o.hash, o.env]));
     const ops = valid.map((h) => byHash.get(h)!).filter(Boolean);
     const frontier: Checkpoint['frontier'] = {};
-    for (const h of this.heads()) if (h.scope === scope) frontier[h.keyId] = { seq: h.seq, hash: h.hash };
+    for (const h of this.validHeads()) if (h.scope === scope) frontier[h.keyId] = { seq: h.seq, hash: h.hash };
     const dir = `${this.domain.scopeDir(scope)}/checkpoints/${signer.keyId}`;
     const existing = ((await this.storage.list(dir)) ?? []).map((f) => OP_FILE_RE.exec(f.name)).filter((m) => m !== null);
     const seq = existing.reduce((mx, m) => Math.max(mx, Number(m![1])), 0) + 1;
@@ -569,6 +628,7 @@ export class Engine {
     const path = this.path(scope, 'checkpoints', signer.keyId, seq);
     await this.storage.writeNew(path, canonicalize(cp));
     this.checkpointsSeen.add(path);
+    this.usedPacks.add(path);
     // Check the own checkpoint like any other (signature, author is admin) in the next recompute.
     this.pendingCheckpoints.push({ path, cp });
     this.checkpointInfo.set(path, { scope, wallTime: rest.wallTime, paths: ops.map((env) => this.path(env.scope, 'ops', env.authorKeyId, env.seq)) });
@@ -586,7 +646,8 @@ export class Engine {
     const covered = new Set<string>();
     for (const [path, info] of this.checkpointInfo) {
       const x = out.get(info.scope);
-      if (!x || bad.has(path)) continue;
+      // Count only packs whose ops a client uses. A pack that was not trusted when it was read does not help.
+      if (!x || bad.has(path) || !this.usedPacks.has(path)) continue;
       x.checkpoints++;
       if (x.lastCheckpoint === null || info.wallTime > x.lastCheckpoint) x.lastCheckpoint = info.wallTime;
       for (const p of info.paths) covered.add(p);

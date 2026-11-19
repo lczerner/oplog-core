@@ -102,8 +102,8 @@ export interface Domain {
   /** Scope of a folder, or null. Inverse of scopeDir. */
   scopeFromDir(dir: string): string | null;
   /**
-   * Lists the scopes that exist in the storage. Order matters: a full scan replays after
-   * each scope, so put the scope with the users and admins first. Then the checkpoints of
+   * Lists the scopes that exist in the storage. Order matters: a full scan replays 1 time
+   * after the first scope, so put the scope with the users and admins first. Then the checkpoints of
    * the later scopes are checked against all admins, not only the root admins.
    */
   discoverScopes(storage: Storage): Promise<ScopeScan>;

@@ -179,13 +179,19 @@ export interface ChainResult {
 }
 
 /**
- * Checks each (scope, author) hash chain. Rules:
- * - seq must start at 1 and have no gaps. Ops after a gap wait (chain-gap).
- * - prevHash must be the hash of the previous op. If not: chain-broken for this op and all later ops.
- * - The HLC must increase along the chain. If not: chain-broken.
- * - A bad signature breaks the chain at that op.
+ * Checks each (scope, author) hash chain. Rules (chain format 2, mytasker Q-24):
+ * - Only validly signed ops of the author are chain members. Any other file in the
+ *   author folder (bad signature, garbage, a misplaced copy) is an issue, and the chain
+ *   skips it. Thus a file that another user saves under the next number does not block
+ *   the author.
+ * - The chain follows the prevHash links from the first op (prevHash null).
+ *   seq must increase along the chain, but it can have gaps.
+ * - The HLC must increase along the chain.
+ * - An op whose prevHash points to an op that is not present waits (chain-gap):
+ *   a deleted or changed op stops the chain there.
+ * - 2 different valid ops with the same seq, or with the same prevHash, are a fork.
+ *   The chain stops before the fork.
  * - An unknown key: the ops wait (the op that registers the key can still be in sync).
- * - 2 different ops with the same seq: fork, the chain stops before the fork.
  */
 export function checkChains(entries: ChainInput[]): ChainResult {
   const groups = new Map<string, ChainInput[]>();
@@ -198,59 +204,90 @@ export function checkChains(entries: ChainInput[]): ChainResult {
   const valid: VerifiedOp[] = [];
   const issues: Issue[] = [];
   const heads = new Map<string, { seq: number; hash: string }>();
+  const base = (e: ChainInput) => ({ scope: e.env.scope, authorKeyId: e.env.authorKeyId, seq: e.env.seq, path: e.path, opId: e.env.opId });
   for (const [k, g] of groups) {
-    const bySeq = new Map<number, ChainInput[]>();
-    for (const e of g) {
-      const l = bySeq.get(e.env.seq) ?? [];
-      if (!l.some((x) => x.hash === e.hash || (x.sig === 'ok' && e.sig === 'ok' && contentKey(x.env) === contentKey(e.env)))) l.push(e);
-      bySeq.set(e.env.seq, l);
-    }
-    const seqs = [...bySeq.keys()].sort((a, b) => a - b);
-    let prev: ChainInput | null = null;
-    let expect = 1;
-    let broken: string | null = null;
-    for (const s of seqs) {
-      const cands = bySeq.get(s)!;
-      const e = cands[0];
-      const base = { scope: e.env.scope, authorKeyId: e.env.authorKeyId, seq: s, path: e.path, opId: e.env.opId };
-      if (broken) {
-        issues.push({ ...base, kind: 'chain-broken', detail: `not applied: ${broken}` });
-        continue;
-      }
-      if (s !== expect) {
-        issues.push({ ...base, kind: 'chain-gap', detail: `waiting for seq ${expect} (missing file)` });
-        broken = `seq ${expect} is missing`;
-        continue;
-      }
-      if (cands.length > 1) {
-        issues.push({ ...base, kind: 'fork', detail: `${cands.length} different ops with seq ${s}` });
-        broken = `fork at seq ${s}`;
-        continue;
-      }
+    // 1. Members: validly signed ops, 1 for each content. Other files are issues only.
+    const members: ChainInput[] = [];
+    const seenHash = new Set<string>();
+    const contentBySeq = new Map<number, Set<string>>();
+    const seqMembers = new Map<number, ChainInput[]>();
+    let unknownKey = false;
+    for (const e of [...g].sort((a, b) => a.env.seq - b.env.seq || (a.path < b.path ? -1 : 1))) {
       if (e.sig === 'unknown-key') {
-        issues.push({ ...base, kind: 'unknown-key', detail: 'signing key is not known (yet)' });
-        broken = 'unknown key';
+        unknownKey = true;
+        issues.push({ ...base(e), kind: 'unknown-key', detail: 'signing key is not known (yet)' });
         continue;
       }
       if (e.sig === 'bad') {
-        issues.push({ ...base, kind: 'bad-signature', detail: 'signature is not valid (file changed?)' });
-        broken = `bad signature at seq ${s}`;
+        issues.push({ ...base(e), kind: 'bad-signature', detail: 'not a validly signed op of this author (changed, or written by another person): skipped' });
         continue;
       }
-      if (e.env.prevHash !== (prev?.hash ?? null)) {
-        issues.push({ ...base, kind: 'chain-broken', detail: 'prevHash does not match the previous op' });
-        broken = `prevHash mismatch at seq ${s}`;
-        continue;
+      // 2 files with the same content are 1 op. The same content always has the same seq, so the
+      // canonical form is needed only for a seq that has more than 1 hash (rare). O(m) in total.
+      if (seenHash.has(e.hash)) continue;
+      seenHash.add(e.hash);
+      const prevSame = seqMembers.get(e.env.seq) ?? [];
+      if (prevSame.length) {
+        let set = contentBySeq.get(e.env.seq);
+        if (!set) contentBySeq.set(e.env.seq, (set = new Set(prevSame.map((x) => contentKey(x.env)))));
+        const ck = contentKey(e.env);
+        if (set.has(ck)) continue;
+        set.add(ck);
+      }
+      members.push(e);
+      seqMembers.set(e.env.seq, [...prevSame, e]);
+    }
+    if (unknownKey) continue; // the full chain waits for the key
+    // 2. Forks: 2 members with the same seq or the same prevHash. The chain stops before the first fork.
+    const forkAt = new Set<ChainInput>();
+    const bySeq = new Map<number, ChainInput[]>();
+    const byPrev = new Map<string, ChainInput[]>();
+    for (const e of members) {
+      bySeq.set(e.env.seq, [...(bySeq.get(e.env.seq) ?? []), e]);
+      const pk = e.env.prevHash ?? 'null';
+      byPrev.set(pk, [...(byPrev.get(pk) ?? []), e]);
+    }
+    for (const l of [...bySeq.values(), ...byPrev.values()]) if (l.length > 1) for (const e of l) forkAt.add(e);
+    // 3. Walk the links.
+    let prev: ChainInput | null = null;
+    const used = new Set<ChainInput>();
+    let stop: string | null = null;
+    for (;;) {
+      const next: ChainInput[] = byPrev.get(prev ? prev.hash : 'null') ?? [];
+      if (next.length === 0) break;
+      if (next.some((e) => forkAt.has(e)) || next.length > 1) {
+        for (const e of next) issues.push({ ...base(e), kind: 'fork', detail: `${next.length} different ops follow the same op` });
+        for (const e of next) used.add(e);
+        stop = 'fork';
+        break;
+      }
+      const e: ChainInput = next[0];
+      used.add(e);
+      if (bySeq.get(e.env.seq)!.length > 1) {
+        issues.push({ ...base(e), kind: 'fork', detail: `${bySeq.get(e.env.seq)!.length} different ops with seq ${e.env.seq}` });
+        stop = 'fork';
+        break;
+      }
+      if (prev && e.env.seq <= prev.env.seq) {
+        issues.push({ ...base(e), kind: 'chain-broken', detail: 'seq is not greater than the seq of the previous op' });
+        stop = 'seq';
+        break;
       }
       if (prev && compareHlc(e.env.hlc, prev.env.hlc) <= 0) {
-        issues.push({ ...base, kind: 'chain-broken', detail: 'HLC is not greater than the HLC of the previous op' });
-        broken = `HLC does not increase at seq ${s}`;
-        continue;
+        issues.push({ ...base(e), kind: 'chain-broken', detail: 'HLC is not greater than the HLC of the previous op' });
+        stop = 'hlc';
+        break;
       }
       valid.push({ env: e.env, hash: e.hash });
+      heads.set(k, { seq: e.env.seq, hash: e.hash });
       prev = e;
-      expect = s + 1;
-      heads.set(k, { seq: s, hash: e.hash });
+    }
+    // 4. Members that are not on the chain wait for a missing op, or come after a stop.
+    for (const e of members) {
+      if (used.has(e)) continue;
+      if (stop) issues.push({ ...base(e), kind: 'chain-broken', detail: `not applied: the chain stops before (${stop})` });
+      else if (forkAt.has(e)) issues.push({ ...base(e), kind: 'fork', detail: 'another valid op has the same seq or the same previous op' });
+      else issues.push({ ...base(e), kind: 'chain-gap', detail: `waiting for the previous op ${e.env.prevHash ?? '(first)'} (missing or changed file)` });
     }
   }
   return { valid, issues, heads };

@@ -18,7 +18,7 @@ describe('integrity', () => {
     storage.files.set(path, canonicalize({ ...e1, payload: { id: 'n1', text: 'changed' } }));
     const fresh = new Engine(storage, notesDomain);
     await fresh.scan();
-    expect(kinds(fresh)).toEqual(expect.arrayContaining(['bad-signature', 'chain-broken']));
+    expect(kinds(fresh)).toEqual(expect.arrayContaining(['bad-signature', 'chain-gap']));
     expect(note(fresh.state, 'n1')).toBeUndefined();
     expect(note(fresh.state, 'n2')).toBeUndefined();
   });
@@ -138,5 +138,13 @@ describe('engine', () => {
     const ops = admin.engine.audit.map((a) => ({ env: admin.engine.knownOps().find((e) => e.opId === a.opId)!, hash: a.hash }));
     const opts = { domain: notesDomain, trustRoot: admin.engine.trustRoot, validKeyBindings: admin.engine.validKeyBindings };
     expect(canonicalize(replay([...ops].reverse(), opts).state)).toBe(canonicalize(replay(ops, opts).state));
+  });
+
+  it('write() of an op that registers a new key passes the check without allowSuperseded', async () => {
+    const { admin, storage } = await world();
+    const { actor } = await import('../helpers');
+    const n = await actor('newbie', storage);
+    await admin.engine.write(admin.signer, 'roles', 'GrantUser', { userId: n.userId, keyId: n.keyId, publicKey: n.publicKey, admin: false });
+    expect(admin.engine.audit[admin.engine.audit.length - 1].status).toBe('applied');
   });
 });

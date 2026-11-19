@@ -15,6 +15,7 @@ Users: `mytasker` ("Úkoly"). `system-vzdelavani` has the same core in its own r
 | `replay` | Deterministic replay with an app `Domain`: authorize, effects, Batch, Revert, revocation fixpoint, derived writes, state checks |
 | `revert` | Revert planning for the UI |
 | `engine` | Scan, incremental or full replay, write with a check, checkpoints, cache |
+| `enrollment` | Access requests `enroll/<name>-<keyIdShort>.json`: public key, name, ISO time, self-signature. The self-signature proves only that the requester has the key, not the name: an admin must compare the fingerprint out of band. |
 | `storage` | `Storage` interface. Adapters: File System Access (browser), memory, Node fs (`oplog-core/node-fs`) |
 
 ## Folder layout
@@ -23,6 +24,7 @@ Users: `mytasker` ("Úkoly"). `system-vzdelavani` has the same core in its own r
 <scopeDir>/ops/<keyId>/<seq 10 digits>.json
 <scopeDir>/checkpoints/<keyId>/<seq 10 digits>.json
 app/trust-root.json
+enroll/<name>-<keyIdShort>.json
 ```
 
 The domain maps each scope to its folder (`Domain.scopeDir`).
@@ -35,7 +37,8 @@ The domain maps each scope to its folder (`Domain.scopeDir`).
 ```
 
 - `sig`: Ed25519 over the JCS of the envelope without `sig`.
-- `prevHash`: `sha256:<hex>` of the JCS of the previous op of the same author and scope.
+- `prevHash`: `sha256:<hex>` of the JCS of the previous valid op of the same author and scope.
+- Chain (format 2): only validly signed ops of the author are chain members. Other files in the author folder are issues, and the chain skips them. The chain follows the `prevHash` links. `seq` must increase but can have gaps. An op whose previous op is missing waits (`chain-gap`). 2 valid ops with the same `seq` or the same `prevHash` are a fork. The writer takes the smallest free number above its own last valid op. Thus a NEW file of another person under the next number cannot block an author. Limit: a person who changes or deletes an EXISTING op file of an author stops that chain at the next op (`chain-gap`) until somebody restores the file (for example from the OneDrive version history or recycle bin). An author can also stop the own chain with a second signed op after an old own op (a fork).
 - Total order: `(hlc.t, hlc.c, authorKeyId, seq, scope)`.
 - `hlc.t` is at most 253 402 300 799 999 (the year 9999) and `hlc.c` is at most 2 147 483 647. Larger values make the op invalid. The HLC must increase along the chain of an author.
 - `sig` must be the canonical base64url text (unused bits are 0). Thus 1 signature has only 1 text.
@@ -65,7 +68,7 @@ An app gives a `Domain` object (`src/domain.ts`): the scopes and their folders, 
 
 A checkpoint is a signed pack of the original ops. The engine uses the ops of a pack only if the pack signature is valid and its author is an admin whose key is not revoked (in the state or in the trust root). Else the engine reads the op files. An op of a trusted pack with a bad signature is dropped, the engine reads the file, and a `bad-checkpoint` issue shows it. Thus a pack can never hide or replace a valid op file. Limit: only a client that reads the bad pack op before the op file shows this issue, and only until it restarts. The replay result is the same on all clients.
 
-A full scan reads the scopes in the order of `Domain.discoverScopes` and replays after each scope. Put the scope with the users and admins first: then the packs of the later scopes can be checked against all admins, not only the root admins.
+A full scan reads the scopes in the order of `Domain.discoverScopes` and replays 1 time after the first scope. Put the scope with the users and admins first: then the packs of the later scopes can be checked against all admins, not only the root admins. Packs of the first scope are trusted only if a root admin signed them. `checkpointStats` counts only packs whose ops the engine used.
 
 ## Storage
 

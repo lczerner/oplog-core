@@ -345,6 +345,27 @@ describe('sibling review regressions', () => {
   });
 });
 
+describe('scan correction', () => {
+  it('a full scan of a new client replays at most 2 times (after the first scope, and at the end)', async () => {
+    const { storage, user, admin } = await world();
+    for (let i = 0; i < 5; i++) await user.engine.write(user.signer, 'data', 'CreateNote', { id: `n${i}`, text: 'x' });
+    await admin.engine.write(admin.signer, 'roles', 'SetFlag', { name: 'f', value: 1 });
+    const fresh = new Engine(storage, notesDomain);
+    await fresh.scan();
+    expect(fresh.stats.fullReplays).toBeLessThanOrEqual(2);
+  });
+
+  it('checkpointStats does not count a pack of the first scope that a new client cannot trust', async () => {
+    const { storage, admin2 } = await world({ admin2: true });
+    await admin2!.engine.scan();
+    await admin2!.engine.createCheckpoint(admin2!.signer, 'roles');
+    const fresh = new Engine(storage, notesDomain);
+    await fresh.scan();
+    expect(fresh.issues.filter((i) => i.kind === 'bad-checkpoint')).toEqual([]);
+    expect(fresh.checkpointStats(['roles'])[0].checkpoints).toBe(0);
+  });
+});
+
 /** Decoder without the canonical check, for the test only. */
 function fromB64uLoose(s: string): Uint8Array {
   const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';

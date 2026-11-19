@@ -6,6 +6,7 @@ export * from './crypto';
 export * from './domain';
 export * from './encoding';
 export * from './engine';
+export * from './enrollment';
 export * from './hlc';
 export * from './ids';
 export * from './paths';
