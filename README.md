@@ -63,7 +63,9 @@ An app gives a `Domain` object (`src/domain.ts`): the scopes and their folders, 
 
 ## Checkpoints
 
-A checkpoint is a signed pack of the original ops. The engine uses the ops of a pack only if the pack signature is valid and its author is an admin (in the state or in the trust root). Else the engine reads the op files. An op of a trusted pack with a bad signature is dropped, and the engine reads the file. Thus a pack can never hide or replace a valid op file.
+A checkpoint is a signed pack of the original ops. The engine uses the ops of a pack only if the pack signature is valid and its author is an admin whose key is not revoked (in the state or in the trust root). Else the engine reads the op files. An op of a trusted pack with a bad signature is dropped, the engine reads the file, and a `bad-checkpoint` issue shows it. Thus a pack can never hide or replace a valid op file. Limit: only a client that reads the bad pack op before the op file shows this issue, and only until it restarts. The replay result is the same on all clients.
+
+A full scan reads the scopes in the order of `Domain.discoverScopes` and replays after each scope. Put the scope with the users and admins first: then the packs of the later scopes can be checked against all admins, not only the root admins.
 
 ## Storage
 

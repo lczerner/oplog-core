@@ -290,6 +290,61 @@ describe('third review regressions', () => {
   });
 });
 
+describe('sibling review regressions', () => {
+  it('a new client trusts the pack of a non-root admin (the roles scope is replayed first)', async () => {
+    const { storage, admin2, user } = await world({ admin2: true });
+    for (let i = 0; i < 5; i++) await user.engine.write(user.signer, 'data', 'CreateNote', { id: `n${i}`, text: 'x' });
+    await admin2!.engine.scan();
+    await admin2!.engine.createCheckpoint(admin2!.signer, 'data');
+    let reads = 0;
+    const counting = Object.assign(Object.create(Object.getPrototypeOf(storage)), storage, { read: async (p: string) => (p.startsWith('data/ops/') && reads++, storage.read(p)) });
+    const fresh = new Engine(counting, notesDomain);
+    await fresh.scan();
+    expect(reads).toBe(0);
+    expect(note(fresh.state, 'n4')).toBeDefined();
+  });
+
+  it('the pack of a revoked admin key is not trusted', async () => {
+    const { storage, admin, admin2, user } = await world({ admin2: true });
+    await user.engine.write(user.signer, 'data', 'CreateNote', { id: 'n1', text: 'x' });
+    await admin2!.engine.scan();
+    await admin2!.engine.createCheckpoint(admin2!.signer, 'data');
+    await admin.engine.scan();
+    await admin.engine.write(admin.signer, 'roles', 'RevokeKey', { keyId: admin2!.keyId, cutoff: { roles: 100, data: 100 } });
+    let reads = 0;
+    const counting = Object.assign(Object.create(Object.getPrototypeOf(storage)), storage, { read: async (p: string) => (p.startsWith('data/ops/') && reads++, storage.read(p)) });
+    const fresh = new Engine(counting, notesDomain);
+    await fresh.scan();
+    // The pack is not used: the engine reads the op files.
+    expect(reads).toBeGreaterThan(0);
+    expect(fresh.issues.some((i) => i.kind === 'bad-checkpoint' && i.detail.includes('revoked'))).toBe(true);
+  });
+
+  it('a trusted pack with a bad op gives a bad-checkpoint issue', async () => {
+    const { storage, admin, user } = await world();
+    await user.engine.write(user.signer, 'data', 'CreateNote', { id: 'n1', text: 'real' });
+    await admin.engine.scan();
+    const path = await admin.engine.createCheckpoint(admin.signer, 'data');
+    const cp = JSON.parse(storage.files.get(path) as string);
+    cp.ops = cp.ops.map((o: any) => (o.authorKeyId === user.keyId ? { ...o, payload: { ...o.payload, text: 'changed' } } : o));
+    const { sig: _s, ...rest } = cp;
+    cp.sig = await admin.signer.sign(new TextEncoder().encode(canonicalize(rest)));
+    storage.files.set(path, canonicalize(cp));
+    const fresh = new Engine(storage, notesDomain);
+    await fresh.scan();
+    expect(note(fresh.state, 'n1')).toMatchObject({ text: 'real' });
+    expect(fresh.issues.some((i) => i.kind === 'bad-checkpoint' && i.detail.includes('bad signature'))).toBe(true);
+  });
+
+  it('a conflict copy with a name that the storage refuses is listed, not read, and does not stop the scan', async () => {
+    const { storage, admin, user } = await world();
+    await user.engine.write(user.signer, 'data', 'CreateNote', { id: 'n1', text: 'x' });
+    storage.files.set(`data/ops/${user.keyId}/0000000001-a:b.json`, 'x');
+    await expect(admin.engine.scan()).resolves.toBeDefined();
+    expect(admin.engine.issues.some((i) => i.kind === 'unknown-file' && i.path!.includes('a:b'))).toBe(true);
+  });
+});
+
 /** Decoder without the canonical check, for the test only. */
 function fromB64uLoose(s: string): Uint8Array {
   const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';

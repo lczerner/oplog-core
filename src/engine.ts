@@ -66,6 +66,9 @@ export interface EngineCache {
   sigOk: string[];
 }
 
+/** File names that the scan may read. The storage adapters refuse "\\" and ":". */
+const SAFE_NAME_RE = /^[^\\:/]+$/;
+
 /** The op is not permitted (rejected by validation or authorize). */
 export class AuthError extends Error {}
 /** The op is permitted, but it would have no effect now (superseded). */
@@ -85,6 +88,8 @@ export class Engine {
   private packedPaths = new Set<string>();
   /** Checkpoint path → result of the pack signature check. */
   private cpSigOk = new Map<string, boolean>();
+  /** Op path → issue: a trusted pack had a bad version of this op. */
+  private packIssues = new Map<string, Issue>();
   /** Checkpoint path → its scope, time and the op paths in it (for the statistics only). */
   private checkpointInfo = new Map<string, { scope: string; wallTime: string; paths: string[] }>();
   private pendingCheckpoints: { path: string; cp: Checkpoint }[] = [];
@@ -175,7 +180,13 @@ export class Engine {
       this.missing = found.missing;
       this.scopes = found.scopes;
       for (const u of found.unknown) this.unknown(u.path, u.detail);
-      for (const scope of found.scopes) await this.scanScope(scope);
+      for (let i = 0; i < found.scopes.length; i++) {
+        const n = this.ops.size;
+        await this.scanScope(found.scopes[i]);
+        // Replay what this scope added before the next scope: then the packs of the next scope
+        // can be checked against the admins of the earlier scopes (for example "roles").
+        if (i < found.scopes.length - 1 && this.ops.size !== n) await this.recompute();
+      }
     }
     if (this.ops.size !== before || this.fileIssues.size !== issuesBefore || mode === 'full') {
       await this.recompute();
@@ -215,6 +226,7 @@ export class Engine {
         if (f.kind === 'file' && OP_FILE_RE.test(f.name)) continue;
         const p = `${dir}/${a.name}/${f.name}`;
         this.unknown(p, 'file name does not match the pattern (conflict copy?)');
+        if (!SAFE_NAME_RE.test(f.name)) continue; // never read a name that the storage refuses
         // A conflict copy "<seq>-<suffix>.json" can hold a second op with the same seq: a fork.
         const m = /^(\d{10})-.+\.json$/.exec(f.name);
         if (kind === 'ops' && f.kind === 'file' && m && !this.forkCandidates.has(p)) {
@@ -312,7 +324,9 @@ export class Engine {
     return dir === null ? null : filePath(dir, 'checkpoints', cp.authorKeyId, cp.seq);
   }
 
+  /** True if the key is an admin key that is not revoked (no cutoff from the trust root or from an op). */
   private isAdminKey(state: ReplayResult['state'], keyId: string): boolean {
+    if (this.result.cutoffs.has(keyId) || this.trustRoot?.roots.some((r) => r.keyId === keyId && r.cutoffs)) return false;
     try {
       const owner = this.domain.keyOwner(state, keyId);
       return owner !== null && this.domain.isAdmin(state, owner);
@@ -338,6 +352,7 @@ export class Engine {
     this.checkpointsSeen.clear();
     this.packedPaths.clear();
     this.cpSigOk.clear();
+    this.packIssues.clear();
     this.checkpointInfo.clear();
     this.pendingCheckpoints = [];
     await this.scan('full');
@@ -360,6 +375,7 @@ export class Engine {
       if (s === 'bad') dropped.push(path);
     }
     if (dropped.length) {
+      for (const path of dropped) this.packIssues.set(path, { kind: 'bad-checkpoint', path, detail: 'a trusted checkpoint contains this op with a bad signature: the file is used instead' });
       for (const path of dropped) {
         this.ops.delete(path);
         this.packedPaths.delete(path);
@@ -413,7 +429,7 @@ export class Engine {
     this.result = this.replayer.result();
     for (const v of chains.valid) this.clock.observe(v.env.hlc);
 
-    const issues: Issue[] = [...this.fileIssues.values(), ...chains.issues, ...this.result.issues];
+    const issues: Issue[] = [...this.fileIssues.values(), ...this.packIssues.values(), ...chains.issues, ...this.result.issues];
     // Local future-clock check: the wall time of the op is far after the time of this computer.
     const now = this.now();
     for (const o of this.ops.values()) {
@@ -435,7 +451,9 @@ export class Engine {
         if (ok !== undefined) this.cpSigOk.set(path, ok);
       }
       const isAdmin = this.isAdminKey(this.state, cp.authorKeyId);
-      if (!ok || !isAdmin) issues.push({ kind: 'bad-checkpoint', path, detail: !ok ? 'checkpoint signature is not valid (or the key is unknown)' : 'checkpoint author is not an admin' });
+      const revoked = this.result.cutoffs.has(cp.authorKeyId) || !!this.trustRoot?.roots.some((r) => r.keyId === cp.authorKeyId && r.cutoffs);
+      if (!ok || !isAdmin)
+        issues.push({ kind: 'bad-checkpoint', path, detail: !ok ? 'checkpoint signature is not valid (or the key is unknown)' : revoked ? 'checkpoint author key is revoked: the pack is not used' : 'checkpoint author is not an admin' });
     }
     this.issues = issues;
   }
