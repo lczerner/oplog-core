@@ -13,7 +13,7 @@ import { filePath, KEY_ID_RE, OP_FILE_RE, parsePath, TRUST_ROOT_PATH } from './p
 import { FUTURE_CLOCK_MS, hasRevocation, orderKey, replayFull, sortOps, type Replayer, type ReplayResult } from './replay';
 import { FileExistsError, type Storage } from './storage/types';
 import type { AuditEntry, Envelope, Issue, TrustRoot, UnsignedEnvelope } from './types';
-import { checkChains, checkEnvelope, KeyMap, parseOpFile, signEnvelope, verifySignature, type ChainInput, type SigStatus } from './verify';
+import { checkChains, checkEnvelope, KeyMap, parseOpFile, signEnvelope, verifySignature, type ChainInput, type ChainResult, type SigStatus } from './verify';
 import { isIso } from './validate';
 
 export interface Signer {
@@ -68,6 +68,34 @@ export interface EngineCache {
 
 /** Numbers that a quick scan tries after a missing number. */
 const QUICK_LOOKAHEAD = 16;
+/**
+ * Files that a scan reads and verifies at the same time. The storage reads and the WebCrypto
+ * checks are async: 1 at a time, the scan mostly waits (docs/performance.md of mytasker).
+ */
+const READ_CONCURRENCY = 32;
+
+/**
+ * Runs `f(item, index)` for each item, with at most `n` calls at the same time.
+ * At the first error, no new call starts, and pool() rejects only after all running calls
+ * have ended. Thus no call runs after the caller (a serial engine task) has ended.
+ */
+export async function pool<T>(items: readonly T[], n: number, f: (x: T, i: number) => Promise<unknown>): Promise<void> {
+  let next = 0;
+  let failed = false;
+  let error: unknown;
+  const worker = async () => {
+    while (!failed && next < items.length) {
+      const i = next++;
+      try {
+        await f(items[i], i);
+      } catch (e) {
+        if (!failed) (failed = true), (error = e);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+  if (failed) throw error;
+}
 
 /** File names that the scan may read. The storage adapters refuse "\\" and ":". */
 const SAFE_NAME_RE = /^[^\\:/]+$/;
@@ -86,6 +114,8 @@ export class Engine {
   private lastSigned = new Map<string, KnownOp>();
   /** scope|keyId → the last op of the valid chain. */
   private chainHeads = new Map<string, { seq: number; hash: string }>();
+  /** The chain check of each (scope|author), with the exact input it was computed from. */
+  private chainCache = new Map<string, { input: string; res: ChainResult }>();
   private forkCandidates = new Map<string, KnownOp>(); // conflict-copy path → op with a seq that has a main file
   private fileIssues = new Map<string, Issue>(); // path → issue (unknown / unparsable files)
   private sigStatus = new Map<string, SigStatus>(); // op hash → ok | bad
@@ -264,13 +294,19 @@ export class Engine {
           if (r && 'env' in r) this.forkCandidates.set(p, { env: r.env, hash: r.hash, source: 'file' });
         }
       }
-      for (const name of names) {
-        if (!OP_FILE_RE.test(name)) continue;
-        const path = `${dir}/${a.name}/${name}`;
-        if (kind === 'ops') {
-          if (!this.ops.has(path)) await this.readOp(path);
-        } else if (!this.checkpointsSeen.has(path)) await this.readCheckpoint(path);
-      }
+      const paths = names.filter((n) => OP_FILE_RE.test(n)).map((n) => `${dir}/${a.name}/${n}`);
+      if (kind === 'ops') {
+        // Read and parse in parallel; the workers change no engine state. Then apply the results
+        // 1 at a time in path order: the same order as the sequential scan (ops, fileIssues).
+        // If 1 read fails, pool() rejects after all reads have ended, and nothing is applied.
+        const todo = paths.filter((p) => !this.ops.has(p));
+        const parsed: (Awaited<ReturnType<typeof parseOpFile>> | null)[] = new Array(todo.length).fill(null);
+        await pool(todo, READ_CONCURRENCY, async (p, i) => {
+          const text = await this.storage.read(p);
+          parsed[i] = text === null ? null : await parseOpFile(p, text, this.domain);
+        });
+        for (let i = 0; i < todo.length; i++) this.applyRead(todo[i], parsed[i]);
+      } else for (const p of paths) if (!this.checkpointsSeen.has(p)) await this.readCheckpoint(p);
     }
   }
 
@@ -293,12 +329,17 @@ export class Engine {
   private async readOp(path: string): Promise<boolean> {
     const text = await this.storage.read(path);
     if (text === null) return false;
-    const r = await parseOpFile(path, text, this.domain);
+    this.applyRead(path, await parseOpFile(path, text, this.domain));
+    return true;
+  }
+
+  /** Records the result of 1 op file read (null: the file does not exist). */
+  private applyRead(path: string, r: Awaited<ReturnType<typeof parseOpFile>> | null): void {
+    if (r === null) return;
     if ('env' in r) {
       this.fileIssues.delete(path);
       this.setOp(path, { env: r.env, hash: r.hash, source: 'file' });
     } else this.fileIssues.set(path, r);
-    return true;
   }
 
   private async readCheckpoint(path: string): Promise<void> {
@@ -402,6 +443,36 @@ export class Engine {
 
   // ---- Verify + replay ---------------------------------------------------------------------
 
+  /**
+   * checkChains for each (scope|author) group, again only for a group whose input changed.
+   * The chains of 2 authors are independent (verify.ts groups the same way), and the result
+   * of 1 group depends only on its entries. The input key lists the path, the hash and the
+   * signature status of each entry, so a change of any of them checks the group again.
+   */
+  private checkChainsCached(entries: ChainInput[]): ChainResult {
+    const groups = new Map<string, ChainInput[]>();
+    for (const e of entries) {
+      const k = `${e.env.scope}|${e.env.authorKeyId}`;
+      let g = groups.get(k);
+      if (!g) groups.set(k, (g = []));
+      g.push(e);
+    }
+    const out: ChainResult = { valid: [], issues: [], heads: new Map() };
+    const cache = new Map<string, { input: string; res: ChainResult }>();
+    for (const [k, g] of groups) {
+      // In the order of `ops` (stable). Another order only misses the cache: that is safe.
+      const input = g.map((e) => `${e.path} ${e.hash} ${e.sig}`).join('\n');
+      const hit = this.chainCache.get(k);
+      const res = hit && hit.input === input ? hit.res : checkChains(g);
+      cache.set(k, { input, res });
+      for (const v of res.valid) out.valid.push(v);
+      for (const i of res.issues) out.issues.push(i);
+      for (const [hk, h] of res.heads) out.heads.set(hk, h);
+    }
+    this.chainCache = cache;
+    return out;
+  }
+
   async recompute(): Promise<void> {
     await this.keys.addFromTrustRoot(this.trustRoot);
     const newEnvs: Envelope[] = [];
@@ -410,12 +481,15 @@ export class Engine {
     await this.keys.addFromOps(newEnvs, this.domain);
     // An op from a pack with a bad signature must not hide the real file: drop it and read the file.
     const dropped: string[] = [];
-    for (const [path, o] of this.ops) {
-      if (o.source !== 'checkpoint' || this.sigStatus.get(o.hash) === 'ok' || !this.keys.get(o.env.authorKeyId)) continue;
+    const packed = [...this.ops].filter(([, o]) => o.source === 'checkpoint' && this.sigStatus.get(o.hash) !== 'ok' && this.keys.get(o.env.authorKeyId));
+    // The signatures are checked in parallel (WebCrypto is async). `dropped` keeps the order of `ops`.
+    const packedBad = new Set<string>();
+    await pool(packed, READ_CONCURRENCY, async ([path, o]) => {
       const s = await verifySignature(o.env, this.keys);
       this.sigStatus.set(o.hash, s);
-      if (s === 'bad') dropped.push(path);
-    }
+      if (s === 'bad') packedBad.add(path);
+    });
+    for (const [path] of packed) if (packedBad.has(path)) dropped.push(path);
     if (dropped.length) {
       for (const path of dropped) this.packIssues.set(path, { kind: 'bad-checkpoint', path, detail: 'a trusted checkpoint contains this op with a bad signature: the file is used instead' });
       for (const path of dropped) {
@@ -428,13 +502,21 @@ export class Engine {
       // Keys that the re-read files register.
       await this.keys.addFromOps(dropped.map((p) => this.ops.get(p)?.env).filter((e): e is Envelope => !!e), this.domain);
     }
+    // Check the signatures that are not known yet, in parallel. Then build the entries in the order of `ops`.
+    const pending = new Map<string, SigStatus>();
+    const todo = [...this.ops.values()].filter((o) => {
+      const s = this.sigStatus.get(o.hash);
+      return s !== 'ok' && s !== 'bad';
+    });
+    await pool(todo, READ_CONCURRENCY, async (o) => {
+      const s = await verifySignature(o.env, this.keys);
+      if (s !== 'unknown-key') this.sigStatus.set(o.hash, s);
+      pending.set(o.hash, s);
+    });
     const entries: ChainInput[] = [];
     for (const [path, o] of this.ops) {
-      let s = this.sigStatus.get(o.hash);
-      if (s !== 'ok' && s !== 'bad') {
-        s = await verifySignature(o.env, this.keys);
-        if (s !== 'unknown-key') this.sigStatus.set(o.hash, s);
-      }
+      // Never pass an op without a checked signature to checkChains: check it here if necessary.
+      const s = this.sigStatus.get(o.hash) ?? pending.get(o.hash) ?? (await verifySignature(o.env, this.keys));
       entries.push({ path, env: o.env, hash: o.hash, sig: s });
     }
     for (const [path, o] of this.forkCandidates) {
@@ -443,7 +525,7 @@ export class Engine {
       // Only a validly signed second op is a fork. A broken copy is only an unknown file.
       if (s === 'ok') entries.push({ path, env: o.env, hash: o.hash, sig: s });
     }
-    const chains = checkChains(entries);
+    const chains = this.checkChainsCached(entries);
     this.chainHeads = chains.heads;
     this.lastSigned = new Map();
     for (const o of this.ops.values()) {
