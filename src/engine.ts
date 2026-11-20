@@ -66,6 +66,12 @@ export interface EngineCache {
   sigOk: string[];
 }
 
+/** 1 op file that a scan read and parsed, before the engine applies it. */
+interface ReadResult {
+  path: string;
+  parsed: Awaited<ReturnType<typeof parseOpFile>>;
+}
+
 /** Numbers that a quick scan tries after a missing number. */
 const QUICK_LOOKAHEAD = 16;
 /**
@@ -239,8 +245,18 @@ export class Engine {
     if (mode === 'quick') {
       // Read forward from the head of each valid chain. Numbers that this client knows (also files
       // with an issue) are skipped, so a known gap does not stop the scan. A full scan lists the folders.
+      // The heads are read in parallel. The workers change no engine state (as in scanKind): each
+      // worker collects its results in read order. Then the results are applied 1 at a time, in the
+      // order of the heads and then of the reads: the same order as a sequential scan. Each head has
+      // its own paths, so the results of 1 head cannot change the look-ahead of another head.
+      // If 1 read fails, pool() rejects after all workers have ended, and nothing is applied.
       const starts = new Map(this.validHeads().map((h) => [`${h.scope}|${h.keyId}`, h.seq]));
-      for (const { scope, keyId } of this.heads()) await this.readForward(scope, keyId, (starts.get(`${scope}|${keyId}`) ?? 0) + 1);
+      const heads = this.heads();
+      const found: ReadResult[][] = heads.map(() => []);
+      await pool(heads, READ_CONCURRENCY, async ({ scope, keyId }, i) => {
+        found[i] = await this.readForward(scope, keyId, (starts.get(`${scope}|${keyId}`) ?? 0) + 1);
+      });
+      for (const list of found) for (const r of list) this.applyRead(r.path, r.parsed);
     } else {
       const found = await this.domain.discoverScopes(this.storage);
       this.missing = found.missing;
@@ -322,15 +338,23 @@ export class Engine {
    * Reads forward from seq. Known numbers are skipped. After a missing number it also tries the
    * next QUICK_LOOKAHEAD numbers, because a gap (chain format 2) can come from files of another
    * person. A larger gap waits for the next full scan.
+   * Changes no engine state: returns the files that exist, in read order. The caller applies them.
    */
-  private async readForward(scope: string, keyId: string, seq: number): Promise<void> {
+  private async readForward(scope: string, keyId: string, seq: number): Promise<ReadResult[]> {
+    const out: ReadResult[] = [];
     let missing = 0;
     for (let s = seq; missing <= QUICK_LOOKAHEAD; s++) {
       const path = this.path(scope, 'ops', keyId, s);
       if (this.ops.has(path) || this.fileIssues.has(path)) continue;
-      if (await this.readOp(path)) missing = 0;
-      else missing++;
+      const text = await this.storage.read(path);
+      if (text === null) {
+        missing++;
+        continue;
+      }
+      out.push({ path, parsed: await parseOpFile(path, text, this.domain) });
+      missing = 0;
     }
+    return out;
   }
 
   /** Returns false if the file does not exist. */
