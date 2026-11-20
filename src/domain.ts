@@ -51,6 +51,38 @@ export interface EffectCtx {
   list(e: string, scope?: string): Entity[];
   /** True if verify.ts checked that keyId is the hash of publicKey. */
   isValidKeyBinding(keyId: string, publicKey: string): boolean;
+  /**
+   * Only for a Revert: the target op, if it is an applied op before the Revert, in the
+   * scope of the Revert, with the hash of the payload. Else undefined (then the replay
+   * rejects the Revert after `authorize`). Read-only: a frozen, shallow copy. The values
+   * `v` and `before` of the writes are the same objects as in the replay and in the state.
+   * The domain must not change them.
+   */
+  revertTarget?: RevertTarget;
+}
+
+/** The target op of a Revert, as `authorize` and the other domain functions see it. */
+export interface RevertTarget {
+  readonly opId: string;
+  readonly hash: string;
+  readonly scope: string;
+  /** The op type of the envelope (`Batch` for a batch). */
+  readonly type: string;
+  /** [type] for a plain op; the item types for a Batch. */
+  readonly itemTypes: readonly string[];
+  /** User of the author key of the target. */
+  readonly userId: string;
+  readonly writes: readonly Readonly<AppliedWrite>[];
+}
+
+/**
+ * The op item lost a race: the state changed before it in the order.
+ * reason: a text for people. code: an optional machine-readable kind that the replay
+ * copies to the audit (`AuditEntry.code`, `ItemNote.code`). The core gives it no meaning.
+ */
+export interface Superseded {
+  superseded: string;
+  code?: string;
 }
 
 /**
@@ -58,10 +90,13 @@ export interface EffectCtx {
  * noEffect: the op is valid but changes nothing (for example the same value again).
  * superseded: the op lost a race. The state changed before it in the order.
  */
-export type EffectResult = { writes: Write[] } | { noEffect: string } | { superseded: string };
+export type EffectResult = { writes: Write[] } | { noEffect: string } | Superseded;
 
 export interface OpDef {
-  /** Scopes in which this op type is valid. */
+  /**
+   * Scopes in which this op type is valid. If the domain has `scopeKind`, these are
+   * scope kinds, and the replay compares them with `scopeKind(scope)` of the op.
+   */
   scopes: readonly string[];
   schema: Schema;
   /** Extra payload checks that need no state. Return an error text, or null. */
@@ -86,7 +121,7 @@ export type RemoveResult =
       /** Fields that the replay computes at the point of the Revert. They are not compared with the payload. */
       computed: string[];
     }
-  | { superseded: string };
+  | Superseded;
 
 export interface ScopeScan {
   scopes: string[];
@@ -101,6 +136,15 @@ export interface Domain {
   scopeDir(scope: string): string | null;
   /** Scope of a folder, or null. Inverse of scopeDir. */
   scopeFromDir(dir: string): string | null;
+  /**
+   * Optional. The kind of a valid scope, for scopes that the app makes at run time
+   * (for example "team" for the scope "team:a1"). If it is given, the replay compares
+   * `OpDef.scopes` with `scopeKind(scope)`. If it is not given, the replay compares
+   * `OpDef.scopes` with the scope itself. Called only for a scope for which `scopeDir`
+   * is not null. An error rejects the op. A kind that is not in `OpDef.scopes` (also a value
+   * that is not a string) rejects the op as not valid in the scope.
+   */
+  scopeKind?(scope: string): string;
   /**
    * Lists the scopes that exist in the storage. Order matters: a full scan replays 1 time
    * after the first scope, so put the scope with the users and admins first. Then the checkpoints of
@@ -146,13 +190,17 @@ export interface Domain {
    * authorize(op, state at that point) → ok | reason. The only permission gate.
    * Called for each plain op, each Batch item (with the state after the earlier
    * items) and each Revert. The replay checks keys and cutoffs before.
+   * For a Revert, `ctx.revertTarget` is the target op (see EffectCtx).
    */
   authorize(item: OpItem, ctx: EffectCtx): AuthResult;
 
   /** Writes that the replay applies after the effects of each item (derived fields). */
   normalize?(writes: AppliedWrite[], ctx: EffectCtx): Write[];
-  /** Checks the state after an item. A text = the item is superseded and its writes are undone. */
-  checkState?(writes: AppliedWrite[], ctx: EffectCtx): string | null;
+  /**
+   * Checks the state after an item. A text or a Superseded result = the item is superseded
+   * and its writes are undone. null = the state is valid.
+   */
+  checkState?(writes: AppliedWrite[], ctx: EffectCtx): string | Superseded | null;
   /** Writes that remove an entity, for a Revert of the op that created it. */
   removeWrites(e: string, id: string, ctx: EffectCtx): RemoveResult;
   /**

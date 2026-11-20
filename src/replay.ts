@@ -7,7 +7,7 @@
 // independent of the order of the input array.
 
 import { canonicalize } from './canonical';
-import { BATCH, hasOp, MAX_BATCH, REVERT, type Domain, type EffectCtx, type OpItem, type OpMeta } from './domain';
+import { BATCH, hasOp, MAX_BATCH, REVERT, type Domain, type EffectCtx, type OpItem, type OpMeta, type RevertTarget, type Superseded } from './domain';
 import { compareHlc } from './hlc';
 import type { AppliedWrite, AuditEntry, Cutoff, Entity, Envelope, Issue, ItemNote, State, TrustRoot, VerifiedOp, Write } from './types';
 import { checkObject, isIso, isUnsafeKey, type Schema } from './validate';
@@ -218,7 +218,35 @@ export function makeCtx(state: State, op: OpMeta, validKeyBindings: Set<string>)
 
 // ---- Inverse of an op (Revert) ------------------------------------------------------------
 
-export type InverseResult = { writes: Write[]; computed: Set<string> } | { superseded: string };
+export type InverseResult = { writes: Write[]; computed: Set<string> } | Superseded;
+
+/**
+ * A read-only copy of an applied op, for `EffectCtx.revertTarget`. The copy is shallow:
+ * the values `v` and `before` of the writes are the same objects as in the state. Do not change them.
+ */
+export function revertTargetOf(t: AppliedInfo): RevertTarget {
+  return Object.freeze({
+    opId: t.opId,
+    hash: t.hash,
+    scope: t.scope,
+    type: t.type,
+    itemTypes: Object.freeze([...t.itemTypes]),
+    userId: t.userId,
+    writes: Object.freeze(t.writes.map((w) => Object.freeze({ ...w }))),
+  });
+}
+
+/** True if the op type is valid in the scope: OpDef.scopes against Domain.scopeKind(scope), or the scope itself. */
+export function validInScope(domain: Domain, scopes: readonly string[], scope: string): boolean {
+  return scopes.includes(domain.scopeKind ? domain.scopeKind(scope) : scope);
+}
+
+/** A superseded note with the code of the domain, if the domain gave a string code. */
+function supersededNote(item: number, type: string, s: Superseded): ItemNote {
+  const n: ItemNote = { item, type, status: 'superseded', reason: s.superseded };
+  if (typeof s.code === 'string') n.code = s.code;
+  return n;
+}
 
 const wkey = (w: { e: string; id: string; f: string }): string => `${w.e}|${w.id}|${w.f}`;
 
@@ -399,7 +427,7 @@ export class Replayer {
       const where = items.length > 1 ? `item ${i} (${it.type})` : it.type;
       if (!hasOp(domain.catalog, it.type)) throw new Reject('invalid-payload', `${where}: unknown op type`);
       const def = domain.catalog[it.type];
-      if (!def.scopes.includes(env.scope)) throw new Reject('invalid-payload', `${where}: not valid in scope ${env.scope}`);
+      if (!validInScope(domain, def.scopes, env.scope)) throw new Reject('invalid-payload', `${where}: not valid in scope ${env.scope}`);
       const err = checkObject(it.payload, def.schema) ?? def.check?.(it.payload) ?? null;
       if (err) throw new Reject('invalid-payload', `${where}: ${err}`);
       const ctx = makeCtx(this.state, meta(i), validKeyBindings);
@@ -407,16 +435,16 @@ export class Replayer {
       if (!a.ok) throw new Reject('unauthorized', `${where}: ${a.reason}`);
       const r = def.effects(it.payload, ctx);
       if ('noEffect' in r) return void entry.notes.push({ item: i, type: it.type, status: 'no-effect', reason: r.noEffect });
-      if ('superseded' in r) return void entry.notes.push({ item: i, type: it.type, status: 'superseded', reason: r.superseded });
+      if ('superseded' in r) return void entry.notes.push(supersededNote(i, it.type, r));
       const res = this.applyChecked(r.writes, ctx, journal);
-      if (typeof res === 'string') return void entry.notes.push({ item: i, type: it.type, status: 'superseded', reason: res });
+      if (!Array.isArray(res)) return void entry.notes.push(supersededNote(i, it.type, res));
       all.push(...res);
     });
     this.finish(entry, all);
   }
 
-  /** Applies writes, the domain's derived writes, and the state check. Returns the reason if the item is superseded. */
-  private applyChecked(writes: Write[], ctx: EffectCtx, journal: JournalEntry[]): AppliedWrite[] | string {
+  /** Applies writes, the domain's derived writes, and the state check. Returns a Superseded result if the item is superseded. */
+  private applyChecked(writes: Write[], ctx: EffectCtx, journal: JournalEntry[]): AppliedWrite[] | Superseded {
     const { domain } = this.opts;
     const scope = ctx.op.scope;
     if (touchesRoot(this.state, scope, writes)) throw new Reject('unauthorized', 'trust root entities cannot be changed by ops');
@@ -430,7 +458,7 @@ export class Replayer {
     const bad = domain.checkState?.(done, ctx) ?? null;
     if (bad) {
       undo(this.state, journal, mark);
-      return bad;
+      return typeof bad === 'string' ? { superseded: bad } : bad;
     }
     // Writes that set a field to the value it had are no change. Keep only real changes.
     return done.filter((w) => !(w.existed && canonicalize(w.before ?? null) === canonicalize(w.v ?? null)));
@@ -442,6 +470,8 @@ export class Replayer {
     else entry.status = entry.notes.some((n) => n.status === 'superseded') ? 'superseded' : 'no-effect';
     const reasons = entry.notes.map((n: ItemNote) => (entry.notes.length > 1 || entry.type === BATCH ? `item ${n.item} (${n.type}): ${n.reason}` : n.reason));
     if (reasons.length) entry.reason = reasons.join('; ');
+    const code = entry.notes[0]?.code;
+    if (entry.status === 'superseded' && entry.type !== BATCH && code !== undefined) entry.code = code;
   }
 
   private revert(env: Envelope, meta: OpMeta, entry: AuditEntry, journal: JournalEntry[]): void {
@@ -452,21 +482,25 @@ export class Replayer {
     entry.revertOf = p.target.opId;
     entry.itemTypes = [REVERT];
     const ctx = makeCtx(this.state, meta, validKeyBindings);
+    // Find the target before authorize, so that authorize can see it (for example its author).
+    // The order of the rejections does not change: authorize first, then the target checks.
+    const target = this.applied.get(p.target.opId);
+    const found = !!target && target.hash === p.target.hash;
+    if (found && target.scope === env.scope) ctx.revertTarget = revertTargetOf(target);
     const a = domain.authorize({ type: REVERT, payload: p }, ctx);
     if (!a.ok) throw new Reject('unauthorized', a.reason);
-    const target = this.applied.get(p.target.opId);
-    if (!target || target.hash !== p.target.hash) throw new Reject('invalid-payload', 'revert target is not an applied op before this op');
+    if (!target || !found) throw new Reject('invalid-payload', 'revert target is not an applied op before this op');
     if (target.scope !== env.scope) throw new Reject('invalid-payload', 'revert must be in the scope of its target');
     for (const t of target.itemTypes) if (t !== REVERT && !(hasOp(domain.catalog, t) && domain.catalog[t].revertible)) throw new Reject('invalid-payload', `${t} cannot be reverted`);
     const inv = computeInverse(target, ctx, domain);
     if ('superseded' in inv) {
-      entry.notes.push({ item: 0, type: REVERT, status: 'superseded', reason: inv.superseded });
+      entry.notes.push(supersededNote(0, REVERT, inv));
       return this.finish(entry, []);
     }
     if (canonicalize(payloadInverse(inv)) !== canonicalize(p.inverse)) throw new Reject('invalid-payload', 'inverse does not match the writes of the target');
     const res = this.applyChecked(inv.writes, ctx, journal);
-    if (typeof res === 'string') {
-      entry.notes.push({ item: 0, type: REVERT, status: 'superseded', reason: res });
+    if (!Array.isArray(res)) {
+      entry.notes.push(supersededNote(0, REVERT, res));
       return this.finish(entry, []);
     }
     this.finish(entry, res);

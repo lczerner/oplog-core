@@ -6,13 +6,18 @@
 // Rules:
 // - Only admins write in roles. Any active user writes notes.
 // - Only the author of a note or an admin can edit or delete it.
-// - A note with the text "LOCKED" cannot be edited (superseded): a status-like guard.
+// - A note with the text "LOCKED" cannot be edited (superseded with the code "locked"): a status-like guard.
 // - normalize: the field "len" of a note is the length of its text (a derived field).
-// - checkState: a note must not have the text "FORBIDDEN" (superseded).
+// - checkState: a note must not have the text "FORBIDDEN" (superseded, a text result without a code)
+//   or "BANNED" (superseded with the code "banned").
+// - Revert: an admin can revert all revertible ops. A user can revert only an own op
+//   whose items are all CreateNote (the authorize function reads ctx.revertTarget).
 // - Like / Unlike: a like entity "<noteId>/<userId>" with on = true/false. The note field
 //   "likeCount" is derived (isDerived): normalize counts it from the changes of "on".
+// - teamNotesDomain only: team scopes "team:<id>" (folder "teams/<id>") that the app makes at
+//   run time. scopeKind gives "team" for them. The note ops are valid in the kind "team".
 
-import type { Domain, EffectCtx, OpDef, OpItem } from '../src/domain';
+import type { Domain, EffectCtx, OpDef, OpItem, RevertTarget } from '../src/domain';
 import { BATCH, REVERT } from '../src/domain';
 import type { AppliedWrite, Cutoff, State, TrustRoot, Write } from '../src/types';
 
@@ -74,7 +79,7 @@ export const catalog: Record<string, OpDef> = {
     revertible: true,
   },
   CreateNote: {
-    scopes: ['data'],
+    scopes: ['data', 'team'],
     schema: { id: 'id', text: { text: 100 } },
     effects: (p, ctx) =>
       ctx.get('note', p.id)
@@ -87,19 +92,19 @@ export const catalog: Record<string, OpDef> = {
     revertible: true,
   },
   EditNote: {
-    scopes: ['data'],
+    scopes: ['data', 'team'],
     schema: { id: 'id', text: { text: 100 } },
     effects: (p, ctx) => {
       const n = ctx.get('note', p.id);
       if (!n || n.status !== 'active') return { superseded: 'no active note' };
-      if (n.text === 'LOCKED') return { superseded: 'note is locked' };
+      if (n.text === 'LOCKED') return { superseded: 'note is locked', code: 'locked' };
       if (n.text === p.text) return { noEffect: 'same text' };
       return ok([{ e: 'note', id: p.id, f: 'text', v: p.text }]);
     },
     revertible: true,
   },
   DeleteNote: {
-    scopes: ['data'],
+    scopes: ['data', 'team'],
     schema: { id: 'id' },
     effects: (p, ctx) => {
       const n = ctx.get('note', p.id);
@@ -108,6 +113,9 @@ export const catalog: Record<string, OpDef> = {
     revertible: true,
   },
 };
+
+/** True if the target of a Revert is an op of the user, with only CreateNote items. */
+const ownCreate = (userId: string, t: RevertTarget | undefined): boolean => !!t && t.userId === userId && t.itemTypes.every((x) => x === 'CreateNote');
 
 const userOf = (state: State, keyId: string): string | null => {
   const k = state.scopes.roles?.key?.[keyId];
@@ -142,7 +150,7 @@ export const notesDomain: Domain = {
   isAdmin: (state, userId) => state.scopes.roles?.user?.[userId]?.admin === true,
   authorize(it: OpItem, ctx: EffectCtx) {
     const admin = ctx.state.scopes.roles?.user?.[ctx.op.userId]?.admin === true;
-    if (it.type === REVERT) return admin ? { ok: true } : { ok: false, reason: 'only admins can revert' };
+    if (it.type === REVERT) return admin || ownCreate(ctx.op.userId, ctx.revertTarget) ? { ok: true } : { ok: false, reason: 'only admins can revert' };
     if (it.type === BATCH) return { ok: false, reason: 'internal: Batch is not an item' };
     if (ADMIN_ONLY.has(it.type)) return admin ? { ok: true } : { ok: false, reason: `only admins can issue ${it.type}` };
     if (it.type === 'EditNote' || it.type === 'DeleteNote') {
@@ -168,14 +176,19 @@ export const notesDomain: Domain = {
     return out;
   },
   checkState(writes, ctx) {
-    for (const w of writes) if (w.e === 'note' && ctx.get('note', w.id)?.text === 'FORBIDDEN') return 'forbidden text';
+    for (const w of writes) {
+      if (w.e !== 'note') continue;
+      const text = ctx.get('note', w.id)?.text;
+      if (text === 'FORBIDDEN') return 'forbidden text';
+      if (text === 'BANNED') return { superseded: 'banned text', code: 'banned' };
+    }
     return null;
   },
   isDerived: (e, f) => e === 'note' && f === 'likeCount',
   removeWrites(e, id, ctx) {
     if (e === 'like') return { writes: [{ e, id, f: 'on', v: false }], computed: [] };
     if (e !== 'note') return { writes: [], computed: [] };
-    if (ctx.get('note', id)?.status === 'deleted') return { superseded: 'note is already deleted' };
+    if (ctx.get('note', id)?.status === 'deleted') return { superseded: 'note is already deleted', code: 'already-deleted' };
     return {
       writes: [
         { e: 'note', id, f: 'status', v: 'deleted' },
@@ -183,5 +196,27 @@ export const notesDomain: Domain = {
       ],
       computed: ['deletedBy'],
     };
+  },
+};
+
+const TEAM_RE = /^team:([a-z0-9-]{1,40})$/;
+const TEAM_DIR_RE = /^teams\/([a-z0-9-]{1,40})$/;
+
+/** The notes domain with team scopes that the app makes at run time (for the tests of scopeKind). */
+export const teamNotesDomain: Domain = {
+  ...notesDomain,
+  scopeDir: (s) => {
+    const m = TEAM_RE.exec(s);
+    return m ? `teams/${m[1]}` : notesDomain.scopeDir(s);
+  },
+  scopeFromDir: (d) => {
+    const m = TEAM_DIR_RE.exec(d);
+    return m ? `team:${m[1]}` : notesDomain.scopeFromDir(d);
+  },
+  scopeKind: (s) => (TEAM_RE.test(s) ? 'team' : s),
+  async discoverScopes(storage) {
+    const base = await notesDomain.discoverScopes(storage);
+    const teams = ((await storage.list('teams')) ?? []).filter((e) => e.kind === 'dir').map((e) => `team:${e.name}`);
+    return { ...base, scopes: [...base.scopes, ...teams.sort()] };
   },
 };

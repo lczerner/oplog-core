@@ -103,7 +103,15 @@ const SAFE_NAME_RE = /^[^\\:/]+$/;
 /** The op is not permitted (rejected by validation or authorize). */
 export class AuthError extends Error {}
 /** The op is permitted, but it would have no effect now (superseded). */
-export class SupersededError extends Error {}
+export class SupersededError extends Error {
+  /** The code of the Superseded result of the domain (AuditEntry.code), if it gave one. */
+  declare readonly code?: string;
+
+  constructor(message?: string, code?: string) {
+    super(message);
+    if (code !== undefined) (this as { code?: string }).code = code;
+  }
+}
 
 export class Engine {
   readonly clock: HlcClock;
@@ -653,7 +661,7 @@ export class Engine {
     await this.keys.addFromOps([{ type, payload } as Envelope], this.domain);
     const r = this.check(signer.keyId, scope, type, payload);
     if (r.status === 'rejected') throw new AuthError(r.reason ?? 'rejected');
-    if (r.status === 'superseded' && !opts.allowSuperseded) throw new SupersededError(r.reason ?? 'superseded');
+    if (r.status === 'superseded' && !opts.allowSuperseded) throw new SupersededError(r.reason ?? 'superseded', r.code);
     for (let attempt = 0; attempt < 3; attempt++) {
       // The numbers that files in the own folder use (valid or not). A file of another person
       // under the next number must not block this author (chain format 2, mytasker Q-24).

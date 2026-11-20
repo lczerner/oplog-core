@@ -5,7 +5,7 @@
 
 import { canonicalize } from './canonical';
 import { hasOp, REVERT, type Domain, type OpMeta } from './domain';
-import { computeInverse, makeCtx, payloadInverse, type ReplayResult } from './replay';
+import { computeInverse, makeCtx, payloadInverse, revertTargetOf, type ReplayResult } from './replay';
 import type { Write } from './types';
 
 export interface Overwritten {
@@ -37,7 +37,10 @@ export function planRevert(result: ReplayResult, opId: string, domain: Domain, m
   if (!target) return { error: 'op was not applied, so it cannot be reverted' };
   if (target.scope !== meta.scope) return { error: 'revert must be in the scope of its target' };
   for (const t of target.itemTypes) if (t !== REVERT && !(hasOp(domain.catalog, t) && domain.catalog[t].revertible)) return { error: `${t} cannot be reverted` };
-  const inv = computeInverse(target, makeCtx(result.state, meta, validKeyBindings), domain);
+  // The same context as in the replay: removeWrites can see the target.
+  const ctx = makeCtx(result.state, meta, validKeyBindings);
+  ctx.revertTarget = revertTargetOf(target);
+  const inv = computeInverse(target, ctx, domain);
   if ('superseded' in inv) return { error: inv.superseded };
 
   const last = new Map<string, Write>();

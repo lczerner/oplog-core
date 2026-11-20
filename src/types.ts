@@ -114,6 +114,8 @@ export interface ItemNote {
   type: string;
   status: 'no-effect' | 'superseded';
   reason: string;
+  /** For a superseded item: the code of the Superseded result of the domain, if it gave one. */
+  code?: string;
 }
 
 export interface AuditEntry {
@@ -128,6 +130,11 @@ export interface AuditEntry {
   wallTime: string;
   status: AuditStatus;
   reason?: string;
+  /**
+   * For a superseded op that is not a Batch (a plain op or a Revert): the code of the
+   * Superseded result of the domain, if it gave one. For a Batch, see `ItemNote.code`.
+   */
+  code?: string;
   writes: AppliedWrite[];
   notes: ItemNote[];
   /** For Batch: the item types. For Revert: the target op ID. */
