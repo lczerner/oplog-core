@@ -41,7 +41,8 @@ export interface ReplayOptions {
   validKeyBindings: Set<string>;
 }
 
-export const batchSchema: Schema = { ops: { list: { object: { type: 'str', payload: 'any' } }, max: MAX_BATCH } };
+// An empty Batch is rejected: it would skip authorize (a user without rights would get no-effect, not a rejection).
+export const batchSchema: Schema = { ops: { list: { object: { type: 'str', payload: 'any' } }, max: MAX_BATCH, min: 1 } };
 export const revertSchema: Schema = {
   target: { object: { opId: 'id', hash: 'str' } },
   inverse: { list: { object: { e: 'str', id: 'id', f: 'str', v: 'any' } }, max: 100_000 },

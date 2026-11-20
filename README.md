@@ -2,7 +2,7 @@
 
 A library for apps that keep their data as a log of signed, immutable JSON op files in a shared folder (for example a synced OneDrive folder). There is no server. Each client reads all op files, checks them and replays them in 1 deterministic order.
 
-Users: `mytasker` ("Úkoly"). `system-vzdelavani` has the same core in its own repository and will migrate later.
+Users: `mytasker` ("Úkoly") and `system-vzdelavani`. Each app links oplog-core as `file:../oplog-core` and pins a commit in its `.oplog-core-ref`.
 
 ## What the library does
 
@@ -56,7 +56,7 @@ Optional hooks. If a domain does not give them, the replay works as before.
 ## Replay rules
 
 1. Keys: the key must be known at the point of the op (`Domain.keyOwner`), and the `seq` must not be above a revocation cutoff. A cutoff applies to all ops of the key, in any order. If a key has more than 1 cutoff, the lowest applies. A scope that a cutoff does not list has the cutoff 0.
-2. Each item (a plain op, or each item of a `Batch`) is validated against its schema and authorized against the state after the earlier items. A rejected item rejects the full op.
+2. Each item (a plain op, or each item of a `Batch`) is validated against its schema and authorized against the state after the earlier items. A rejected item rejects the full op. An empty `Batch` is rejected (`invalid-payload`), because it would skip `authorize`.
 3. `effects()` returns writes, `noEffect` or `superseded` (with an optional `code`). A superseded item has no effect. The other items of a Batch apply.
 4. After the writes of an item: `normalize` (derived writes), then `checkState`. If `checkState` fails, the writes of the item are undone and the item is superseded.
 5. Ops cannot change entities with `root: true` (from the trust root).
