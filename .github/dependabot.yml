@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: MIT
+# Copyright 2026, Lukáš Czerner <lukas@czerner.cz>
+# Dependency updates. Security updates are separate (repository settings:
+# Dependabot alerts and Dependabot security updates, both on).
+# oplog-core has only build and test tools (no runtime dependencies).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Prague
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+      prefix-development: deps-dev
+    groups:
+      # 1 PR for all minor and patch updates. Major updates come as separate PRs.
+      dev-tools:
+        dependency-type: development
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Prague
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]

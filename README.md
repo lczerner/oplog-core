@@ -77,10 +77,13 @@ Paths are relative to the shared root and use `/`. The adapters refuse empty seg
 ## Commands
 
 ```sh
-npm install
-npm test
-npm run typecheck
+make install      # npm ci
+make check        # typecheck, tests, SBOM with its check
+make sbom         # SBOMs in sbom/ (runtime + build, CycloneDX, or SPDX with SBOM_FORMAT=spdx)
+make help         # all targets
 ```
+
+The Git workflow (branches, pull requests, CI, Dependabot) is in `AGENTS.md`.
 
 ## Use from an app
 
