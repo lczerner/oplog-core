@@ -76,7 +76,7 @@ interface ReadResult {
 const QUICK_LOOKAHEAD = 16;
 /**
  * Files that a scan reads and verifies at the same time. The storage reads and the WebCrypto
- * checks are async: 1 at a time, the scan mostly waits (docs/performance.md of mytasker).
+ * checks are async: if the scan reads 1 file at a time, it mostly waits for them.
  */
 const READ_CONCURRENCY = 32;
 
@@ -173,7 +173,8 @@ export class Engine {
 
   /**
    * Runs scans, writes, checkpoints and cache imports 1 at a time. 2 writes at the same time
-   * would both link to the same own last op: a fork that stops the own chain (ADR 0014).
+   * would both link to the same own last op: a fork that stops the own chain. Thus 1 engine
+   * never writes 2 ops of 1 author at the same time.
    */
   private queue: Promise<unknown> = Promise.resolve();
   private serial<T>(f: () => Promise<T>): Promise<T> {
@@ -688,7 +689,9 @@ export class Engine {
     if (r.status === 'superseded' && !opts.allowSuperseded) throw new SupersededError(r.reason ?? 'superseded', r.code);
     for (let attempt = 0; attempt < 3; attempt++) {
       // The numbers that files in the own folder use (valid or not). A file of another person
-      // under the next number must not block this author (chain format 2, mytasker Q-24).
+      // under the next number must not block this author. Chain format 2: the chain skips files
+      // that are not valid ops of the author. The writer takes the smallest free number above
+      // its own last valid op.
       const dir = `${this.domain.scopeDir(scope)}/ops/${signer.keyId}`;
       const taken = new Set<number>();
       let fresh = false;

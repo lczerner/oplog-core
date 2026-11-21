@@ -2,7 +2,7 @@
 
 A library for apps that keep their data as a log of signed, immutable JSON op files in a shared folder (for example a synced OneDrive folder). There is no server. Each client reads all op files, checks them and replays them in 1 deterministic order.
 
-Users: `mytasker` ("Úkoly") and `system-vzdelavani`. Each app links oplog-core as `file:../oplog-core` and pins a commit in its `.oplog-core-ref`.
+Users: `mytasker` ("Úkoly") and other apps of the owner. Each app links oplog-core as `file:../oplog-core` and pins a commit in its `.oplog-core-ref`.
 
 ## What the library does
 
@@ -100,3 +100,7 @@ No package registry is used. The app depends on a local checkout or a git commit
 ```
 
 Import from `oplog-core` in browser code and from `oplog-core/node-fs` in Node code only.
+
+## License
+
+MIT. Copyright 2026, Lukáš Czerner <lukas@czerner.cz>. See `LICENSE`.

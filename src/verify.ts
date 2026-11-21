@@ -179,7 +179,7 @@ export interface ChainResult {
 }
 
 /**
- * Checks each (scope, author) hash chain. Rules (chain format 2, mytasker Q-24):
+ * Checks each (scope, author) hash chain. Rules (chain format 2):
  * - Only validly signed ops of the author are chain members. Any other file in the
  *   author folder (bad signature, garbage, a misplaced copy) is an issue, and the chain
  *   skips it. Thus a file that another user saves under the next number does not block
