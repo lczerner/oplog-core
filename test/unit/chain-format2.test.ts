@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026, Lukáš Czerner <lukas@czerner.cz>
-// Chain format 2 (mytasker Q-24): a file of another person under the next number
+// Chain format 2: a file of another person under the next number
 // of an author must not block that author. Synthetic data only.
 import { canonicalize } from '../../src/canonical';
 import { Engine } from '../../src/engine';
