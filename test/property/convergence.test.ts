@@ -53,6 +53,12 @@ async function buildOpSet() {
   await admin2!.engine.write(admin2!.signer, 'data', 'CreateNote', { id: 'n4', text: 'a2' });
   await user.engine.write(user.signer, 'data', 'EditNote', { id: 'n1', text: 'user edit' });
   await u2.engine.write(u2.signer, 'data', 'DeleteNote', { id: 'n3' });
+  // A non-admin reverts an own CreateNote: authorize permits it only through ctx.revertTarget.
+  const own = await user.engine.write(user.signer, 'data', 'CreateNote', { id: 'n5', text: 'own' });
+  const userMeta = { opId: 'plan', scope: 'data', authorKeyId: user.keyId, userId: user.userId, seq: 1, hlc: { t: 0, c: 0 }, wallTime: '', envType: 'Revert', item: 0 };
+  const ownPlan = planRevert(user.engine.result, own.opId, notesDomain, userMeta, user.engine.validKeyBindings);
+  if ('error' in ownPlan) throw new Error(ownPlan.error);
+  await user.engine.write(user.signer, 'data', 'Revert', ownPlan.payload);
   await admin.engine.scan();
   await admin.engine.write(admin.signer, 'data', 'EditNote', { id: 'n2', text: 'admin edit' });
   const target = admin.engine.audit.find((a) => a.type === 'EditNote' && a.status === 'applied' && a.authorKeyId === user.keyId)!;
@@ -62,8 +68,10 @@ async function buildOpSet() {
   await admin.engine.write(admin.signer, 'data', 'Revert', plan.payload);
   await admin.engine.write(admin.signer, 'roles', 'RevokeKey', { keyId: u2.keyId, cutoff: { data: 2 } });
   await admin2!.engine.write(admin2!.signer, 'data', 'EditNote', { id: 'n4', text: 'FORBIDDEN' }, { allowSuperseded: true });
+  await admin2!.engine.write(admin2!.signer, 'data', 'EditNote', { id: 'n4', text: 'BANNED' }, { allowSuperseded: true }); // superseded with a code
   const ref = new Engine(storage, notesDomain, { now: fakeClock().now });
   await ref.scan();
+  if (ref.state.scopes.data.note.n5?.status !== 'deleted') throw new Error('the Revert of the own CreateNote did not apply');
   const opPaths = [...storage.files.keys()].filter((p) => p.includes('/ops/'));
   return { storage, ref, opPaths };
 }
@@ -71,7 +79,7 @@ async function buildOpSet() {
 describe('convergence (property)', async () => {
   const { storage, ref, opPaths } = await buildOpSet();
   const refState = canonicalize(ref.state);
-  const summary = (e: Engine) => canonicalize({ audit: e.audit.map((a) => [a.opId, a.status, a.reason ?? null]), issues: e.result.issues.map((i) => [i.kind, i.opId ?? null]) });
+  const summary = (e: Engine) => canonicalize({ audit: e.audit.map((a) => [a.opId, a.status, a.reason ?? null, a.code ?? null, a.notes.map((n) => n.code ?? null)]), issues: e.result.issues.map((i) => [i.kind, i.opId ?? null]) });
   const refSummary = summary(ref);
   const verified = ref.audit.map((a) => ({ env: ref.knownOps().find((e) => e.opId === a.opId)!, hash: a.hash }));
 

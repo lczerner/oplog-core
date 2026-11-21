@@ -2,7 +2,7 @@
 
 A library for apps that keep their data as a log of signed, immutable JSON op files in a shared folder (for example a synced OneDrive folder). There is no server. Each client reads all op files, checks them and replays them in 1 deterministic order.
 
-Users: `mytasker` ("Úkoly"). `system-vzdelavani` has the same core in its own repository and will migrate later.
+Users: `mytasker` ("Úkoly") and `system-vzdelavani`. Each app links oplog-core as `file:../oplog-core` and pins a commit in its `.oplog-core-ref`.
 
 ## What the library does
 
@@ -47,14 +47,20 @@ The domain maps each scope to its folder (`Domain.scopeDir`).
 
 An app gives a `Domain` object (`src/domain.ts`): the scopes and their folders, the op catalogue (schema and `effects()` for each op type), `authorize()`, the initial state from the trust root, the owner of a key, the keys that an op registers, the revocation cutoffs, derived writes (`normalize`), state checks (`checkState`) and the remove writes for a Revert. All domain functions must be pure and deterministic.
 
+Optional hooks. If a domain does not give them, the replay works as before.
+
+- `scopeKind(scope)`: the kind of a scope that the app makes at run time (for example `team` for the scope `team:a1`). If it is given, the replay compares `OpDef.scopes` with `scopeKind(scope)` of the op. If it is not given, the replay compares `OpDef.scopes` with the scope itself. An error rejects the op.
+- `EffectCtx.revertTarget`: for a Revert, `authorize` (and the later domain functions of the Revert) get a read-only copy of the target op (`RevertTarget`: op ID, hash, scope, type, item types, user, writes). The copy is frozen but shallow: the values `v` and `before` of the writes are the same objects as in the state, and the domain must not change them. For example, `authorize` can let a user revert only own ops. The field is undefined if the target is not an applied op before the Revert, with the same hash, in the same scope. Then the replay rejects the Revert after `authorize`. `Engine.check()` and `planRevert()` give the same field.
+- `code` in a superseded result (`Superseded`: `{ superseded, code? }`) of `effects`, `checkState` and `removeWrites`: a machine-readable kind for the app, for example for a list of one kind of superseded change. The replay copies it to `ItemNote.code`, and to `AuditEntry.code` for a superseded op that is not a Batch. `Engine.write()` puts it in `SupersededError.code`. The core gives it no meaning. `checkState` can also return a text, as before (no code).
+
 ## Replay rules
 
 1. Keys: the key must be known at the point of the op (`Domain.keyOwner`), and the `seq` must not be above a revocation cutoff. A cutoff applies to all ops of the key, in any order. If a key has more than 1 cutoff, the lowest applies. A scope that a cutoff does not list has the cutoff 0.
-2. Each item (a plain op, or each item of a `Batch`) is validated against its schema and authorized against the state after the earlier items. A rejected item rejects the full op.
-3. `effects()` returns writes, `noEffect` or `superseded`. A superseded item has no effect. The other items of a Batch apply.
+2. Each item (a plain op, or each item of a `Batch`) is validated against its schema and authorized against the state after the earlier items. A rejected item rejects the full op. An empty `Batch` is rejected (`invalid-payload`), because it would skip `authorize`.
+3. `effects()` returns writes, `noEffect` or `superseded` (with an optional `code`). A superseded item has no effect. The other items of a Batch apply.
 4. After the writes of an item: `normalize` (derived writes), then `checkState`. If `checkState` fails, the writes of the item are undone and the item is superseded.
 5. Ops cannot change entities with `root: true` (from the trust root).
-6. `Revert`: the target must be an applied op in the same scope, before the Revert. The replay computes the inverse itself (the `before` values, and `Domain.removeWrites` for created entities). The payload must contain the same inverse, without the computed fields.
+6. `Revert`: `authorize` runs first (with `ctx.revertTarget`). Then the target must be an applied op in the same scope, before the Revert. The replay computes the inverse itself (the `before` values, and `Domain.removeWrites` for created entities). The payload must contain the same inverse, without the computed fields.
 7. A field for which `Domain.isDerived` is true is not part of a Revert inverse. `normalize` computes it again.
 8. Errors in domain code:
    - During the replay of an op: only that op is rejected (issue kind `domain`).

@@ -3,6 +3,12 @@
 import { checkObject, checkValue, isUrl } from '../../src/validate';
 
 describe('validator', () => {
+  it('checks the minimum and the maximum length of a list', () => {
+    expect(checkValue([], { list: 'int', max: 3, min: 1 }, 'p')).toMatch('at least 1 item');
+    expect(checkValue([1], { list: 'int', max: 3, min: 1 }, 'p')).toBeNull();
+    expect(checkValue([1, 2, 3, 4], { list: 'int', max: 3, min: 1 }, 'p')).toMatch('too many items');
+    expect(checkValue([], { list: 'int', max: 3 }, 'p')).toBeNull();
+  });
   it('checks text length and control characters', () => {
     expect(checkValue('Úkol č. 1', { text: 20 }, 'p')).toBeNull();
     expect(checkValue('x'.repeat(21), { text: 20 }, 'p')).toMatch('longer than 20');

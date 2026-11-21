@@ -151,3 +151,135 @@ describe('chain cache', () => {
     expect(['g1', 'g2', 'g3'].every((id) => note(e.state, id))).toBe(true);
   });
 });
+
+describe('parallel quick scan', () => {
+  const sorted = (x: ReturnType<typeof summary>) => ({ ...x, issues: [...x.issues].sort(), audit: [...x.audit].sort() });
+
+  /** An engine after a full scan, and new files of 3 heads: a gap, a file with an issue, a head with nothing new. */
+  async function polled(seeds: number[] = []) {
+    const { storage, admin, user, clock } = await world();
+    for (let i = 0; i < 3; i++) await user.engine.write(user.signer, 'data', 'CreateNote', { id: `u${i}`, text: 'u' });
+    await admin.engine.write(admin.signer, 'data', 'CreateNote', { id: 'a0', text: 'a' });
+    // A file with an issue that the engine knows before the poll: the quick scan skips its number.
+    await storage.writeNew(filePath('data', 'ops', user.keyId, 6), 'garbage known');
+    const e = new Engine(storage, notesDomain, { now: clock.now });
+    await e.scan();
+    // More engines in the same state, whose reads end in a random order.
+    const others = seeds.map((seed) => new Engine(shuffled(storage, seed), notesDomain, { now: clock.now }));
+    for (const o of others) await o.scan();
+    // New files. user: seq 4 and 5, then 7 (6 is the known issue), 8 is missing, 9 is present (in the look-ahead).
+    for (let i = 3; i < 5; i++) await user.engine.write(user.signer, 'data', 'CreateNote', { id: `u${i}`, text: 'u' });
+    await storage.writeNew(filePath('data', 'ops', user.keyId, 7), 'garbage 7');
+    await storage.writeNew(filePath('data', 'ops', user.keyId, 9), 'garbage 9');
+    // admin in data: 2 new ops and a new file with an issue. admin in roles: nothing new.
+    for (let i = 1; i < 3; i++) await admin.engine.write(admin.signer, 'data', 'CreateNote', { id: `a${i}`, text: 'a' });
+    await storage.writeNew(filePath('data', 'ops', admin.keyId, 4), 'garbage admin');
+    return { storage, e, others, clock, admin, user };
+  }
+
+  it('gives the same ops, issues and state as a full scan, for any order of the reads', async () => {
+    const { storage, e, others, admin, user } = await polled([1, 2, 3]);
+    expect(e.heads().length).toBeGreaterThanOrEqual(3);
+    expect(await e.scan('quick')).toBe(true);
+    const ref = new Engine(storage, notesDomain);
+    await ref.scan();
+    expect(sorted(summary(e))).toEqual(sorted(summary(ref)));
+    expect(note(e.state, 'u4')).toBeDefined();
+    expect(e.issues.filter((i) => i.kind === 'parse-error').map((i) => i.path).sort()).toEqual(
+      [filePath('data', 'ops', admin.keyId, 4), ...[6, 7, 9].map((n) => filePath('data', 'ops', user.keyId, n))].sort(),
+    );
+    // The exact order (of the issues too) does not depend on the order in which the reads end.
+    for (const o of others) {
+      expect(await o.scan('quick')).toBe(true);
+      expect(summary(o)).toEqual(summary(e));
+    }
+    // Nothing new: the next quick scan finds nothing and changes nothing.
+    const before = summary(e);
+    expect(await e.scan('quick')).toBe(false);
+    expect(summary(e)).toEqual(before);
+  });
+
+  it('a failed read: the quick scan rejects and applies nothing, also of the other heads', async () => {
+    const { storage, e } = await polled();
+    const heads = canonicalize(e.heads());
+    const issues = canonicalize(e.issues);
+    // Fail the first read of the LAST head: a sequential scan applies the earlier heads before it.
+    const lastHead = e.heads()[e.heads().length - 1];
+    const failPath = filePath(lastHead.scope, 'ops', lastHead.keyId, e.validHeads().find((h) => h.scope === lastHead.scope && h.keyId === lastHead.keyId)!.seq + 1);
+    let fail = true;
+    const s = Object.create(storage) as Storage;
+    s.read = async (p: string) => {
+      if (fail && p === failPath) throw new Error('NotReadableError');
+      return storage.read(p);
+    };
+    (e as unknown as { storage: Storage }).storage = s;
+    await expect(e.scan('quick')).rejects.toThrow('NotReadableError');
+    expect(canonicalize(e.heads())).toBe(heads);
+    expect(canonicalize(e.issues)).toBe(issues);
+    fail = false;
+    expect(await e.scan('quick')).toBe(true);
+    const ref = new Engine(storage, notesDomain);
+    await ref.scan();
+    expect(sorted(summary(e))).toEqual(sorted(summary(ref)));
+  });
+
+  it('reads the heads in parallel', async () => {
+    const { storage, e } = await polled();
+    let running = 0;
+    let max = 0;
+    let reads = 0;
+    const s = Object.create(storage) as Storage;
+    s.read = async (p: string) => {
+      reads++;
+      max = Math.max(max, ++running);
+      await new Promise((r) => setTimeout(r, 2));
+      running--;
+      return storage.read(p);
+    };
+    (e as unknown as { storage: Storage }).storage = s;
+    await e.scan('quick');
+    expect(reads).toBeGreaterThan(e.heads().length);
+    expect(max).toBeGreaterThan(1);
+  });
+});
+
+describe('quick scan look-ahead (regression)', () => {
+  /** An engine after a full scan of 7 ops of the user in data, on a storage that counts the reads of each path. */
+  async function headAt7() {
+    const { storage, user, clock } = await world();
+    for (let i = 0; i < 7; i++) await user.engine.write(user.signer, 'data', 'CreateNote', { id: `n${i}`, text: 't' });
+    const reads = new Map<string, number>();
+    const s = Object.create(storage) as Storage;
+    s.read = async (p: string) => {
+      reads.set(p, (reads.get(p) ?? 0) + 1);
+      return storage.read(p);
+    };
+    return { storage, user, clock, reads, s };
+  }
+
+  it('starts the look-ahead again after a found file', async () => {
+    const { storage, user, clock, s } = await headAt7();
+    const e = new Engine(s, notesDomain, { now: clock.now });
+    await e.scan();
+    // seq 8 is missing, 9 exists, 10..25 (16 numbers) are missing, 26 exists.
+    await storage.writeNew(filePath('data', 'ops', user.keyId, 9), 'garbage 9');
+    await storage.writeNew(filePath('data', 'ops', user.keyId, 26), 'garbage 26');
+    await e.scan('quick');
+    const found = e.issues.filter((i) => i.kind === 'parse-error').map((i) => i.path);
+    expect(found).toEqual([filePath('data', 'ops', user.keyId, 9), filePath('data', 'ops', user.keyId, 26)]);
+  });
+
+  it('does not read a path with a known issue again', async () => {
+    const { storage, user, clock, reads, s } = await headAt7();
+    const bad = filePath('data', 'ops', user.keyId, 8);
+    await storage.writeNew(bad, 'garbage 8');
+    const e = new Engine(s, notesDomain, { now: clock.now });
+    await e.scan();
+    expect(e.issues.some((i) => i.path === bad)).toBe(true);
+    reads.clear();
+    await e.scan('quick');
+    expect(reads.get(bad)).toBeUndefined();
+    // The scan reads on after the known number.
+    expect(reads.get(filePath('data', 'ops', user.keyId, 9))).toBe(1);
+  });
+});

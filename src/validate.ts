@@ -18,7 +18,7 @@ export type FieldType =
   | { text: number; multiline?: boolean; min?: number } // string with a max length, no control characters (line breaks only if multiline)
   | { url: readonly string[]; max: number } // absolute URL with one of these schemes (for example ['http:', 'https:', 'mailto:'])
   | { enum: readonly string[]; nullable?: boolean } // nullable: null is also permitted
-  | { list: FieldType; max: number }
+  | { list: FieldType; max: number; min?: number }
   | { object: Schema; nullable?: boolean }
   | { map: FieldType; max: number } // object with any keys, values of 1 type
   | 'any';
@@ -108,6 +108,7 @@ export function checkValue(v: unknown, t: FieldType, path: string): string | nul
   if ('list' in t) {
     if (!Array.isArray(v)) return `${path}: list expected`;
     if (v.length > t.max) return `${path}: too many items`;
+    if (v.length < (t.min ?? 0)) return `${path}: at least ${t.min} item(s) expected`;
     for (let i = 0; i < v.length; i++) {
       const e = checkValue(v[i], t.list, `${path}[${i}]`);
       if (e) return e;

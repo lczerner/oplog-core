@@ -66,6 +66,12 @@ export interface EngineCache {
   sigOk: string[];
 }
 
+/** 1 op file that a scan read and parsed, before the engine applies it. */
+interface ReadResult {
+  path: string;
+  parsed: Awaited<ReturnType<typeof parseOpFile>>;
+}
+
 /** Numbers that a quick scan tries after a missing number. */
 const QUICK_LOOKAHEAD = 16;
 /**
@@ -103,7 +109,15 @@ const SAFE_NAME_RE = /^[^\\:/]+$/;
 /** The op is not permitted (rejected by validation or authorize). */
 export class AuthError extends Error {}
 /** The op is permitted, but it would have no effect now (superseded). */
-export class SupersededError extends Error {}
+export class SupersededError extends Error {
+  /** The code of the Superseded result of the domain (AuditEntry.code), if it gave one. */
+  declare readonly code?: string;
+
+  constructor(message?: string, code?: string) {
+    super(message);
+    if (code !== undefined) (this as { code?: string }).code = code;
+  }
+}
 
 export class Engine {
   readonly clock: HlcClock;
@@ -231,8 +245,18 @@ export class Engine {
     if (mode === 'quick') {
       // Read forward from the head of each valid chain. Numbers that this client knows (also files
       // with an issue) are skipped, so a known gap does not stop the scan. A full scan lists the folders.
+      // The heads are read in parallel. The workers change no engine state (as in scanKind): each
+      // worker collects its results in read order. Then the results are applied 1 at a time, in the
+      // order of the heads and then of the reads: the same order as a sequential scan. Each head has
+      // its own paths, so the results of 1 head cannot change the look-ahead of another head.
+      // If 1 read fails, pool() rejects after all workers have ended, and nothing is applied.
       const starts = new Map(this.validHeads().map((h) => [`${h.scope}|${h.keyId}`, h.seq]));
-      for (const { scope, keyId } of this.heads()) await this.readForward(scope, keyId, (starts.get(`${scope}|${keyId}`) ?? 0) + 1);
+      const heads = this.heads();
+      const found: ReadResult[][] = heads.map(() => []);
+      await pool(heads, READ_CONCURRENCY, async ({ scope, keyId }, i) => {
+        found[i] = await this.readForward(scope, keyId, (starts.get(`${scope}|${keyId}`) ?? 0) + 1);
+      });
+      for (const list of found) for (const r of list) this.applyRead(r.path, r.parsed);
     } else {
       const found = await this.domain.discoverScopes(this.storage);
       this.missing = found.missing;
@@ -314,15 +338,23 @@ export class Engine {
    * Reads forward from seq. Known numbers are skipped. After a missing number it also tries the
    * next QUICK_LOOKAHEAD numbers, because a gap (chain format 2) can come from files of another
    * person. A larger gap waits for the next full scan.
+   * Changes no engine state: returns the files that exist, in read order. The caller applies them.
    */
-  private async readForward(scope: string, keyId: string, seq: number): Promise<void> {
+  private async readForward(scope: string, keyId: string, seq: number): Promise<ReadResult[]> {
+    const out: ReadResult[] = [];
     let missing = 0;
     for (let s = seq; missing <= QUICK_LOOKAHEAD; s++) {
       const path = this.path(scope, 'ops', keyId, s);
       if (this.ops.has(path) || this.fileIssues.has(path)) continue;
-      if (await this.readOp(path)) missing = 0;
-      else missing++;
+      const text = await this.storage.read(path);
+      if (text === null) {
+        missing++;
+        continue;
+      }
+      out.push({ path, parsed: await parseOpFile(path, text, this.domain) });
+      missing = 0;
     }
+    return out;
   }
 
   /** Returns false if the file does not exist. */
@@ -653,7 +685,7 @@ export class Engine {
     await this.keys.addFromOps([{ type, payload } as Envelope], this.domain);
     const r = this.check(signer.keyId, scope, type, payload);
     if (r.status === 'rejected') throw new AuthError(r.reason ?? 'rejected');
-    if (r.status === 'superseded' && !opts.allowSuperseded) throw new SupersededError(r.reason ?? 'superseded');
+    if (r.status === 'superseded' && !opts.allowSuperseded) throw new SupersededError(r.reason ?? 'superseded', r.code);
     for (let attempt = 0; attempt < 3; attempt++) {
       // The numbers that files in the own folder use (valid or not). A file of another person
       // under the next number must not block this author (chain format 2, mytasker Q-24).

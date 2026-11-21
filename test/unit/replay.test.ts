@@ -70,6 +70,12 @@ describe('Batch', () => {
     expect(note(user.engine.state, 'n1')).toMatchObject({ text: 'b', len: 1 });
   });
 
+  it('rejects an empty batch: it must not skip authorize (no-effect for a user without rights)', async () => {
+    const { user } = await world();
+    expect(user.engine.check(user.keyId, 'data', 'Batch', { ops: [] })).toMatchObject({ status: 'rejected', reason: expect.stringContaining('at least 1 item') });
+    await expect(user.engine.write(user.signer, 'data', 'Batch', { ops: [] })).rejects.toThrow(AuthError);
+  });
+
   it('rejects the full batch if 1 item is not authorized, and undoes the earlier items', async () => {
     const { admin, user } = await world();
     await admin.engine.write(admin.signer, 'data', 'CreateNote', { id: 'a1', text: 'admin note' });
