@@ -1,7 +1,7 @@
 {
   "name": "oplog-core",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Signed, immutable op log on a shared folder: canonical JSON, Ed25519, HLC, hash chains, deterministic replay with an app domain",
   "exports": {
