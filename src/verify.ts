@@ -3,11 +3,13 @@
 // Parsing, signature and hash-chain checks. Async (WebCrypto). Independent of the replay order.
 
 import { canonicalize } from './canonical';
-import { hashCanonical, importPublicKey, keyIdFromPublicKey, signBytes, verifyBytes } from './crypto';
-import { BATCH, type Domain, type OpItem } from './domain';
+import { hashCanonical, importWellFormedPublicKey, isAcceptableEd25519PublicKey, isWebCryptoRejection, isWellFormedEd25519PublicKey, keyIdFromPublicKey, signBytes, verifyBytes } from './crypto';
+import { BATCH, MAX_BATCH, type Domain, type OpItem } from './domain';
+import { fromB64u } from './encoding';
 import { utf8 } from './encoding';
 import { compareHlc, isValidHlc } from './hlc';
 import { parsePath, type ParsedPath } from './paths';
+import type { KeyBindings } from './replay';
 import type { Envelope, Issue, TrustRoot, UnsignedEnvelope, VerifiedOp } from './types';
 import { checkObject, isPlainObject } from './validate';
 
@@ -103,58 +105,139 @@ export function itemsOf(env: { type: string; payload: Record<string, unknown> })
 
 // ---- Key map ---------------------------------------------------------------------------
 
-/** keyId → public key, from the trust root and from the ops that register keys. */
-export class KeyMap {
-  private keys = new Map<string, CryptoKey>();
-  readonly validBindings = new Set<string>();
-  private checked = new Set<string>();
+/**
+ * keyId → public key, from the trust root and from the ops that register keys.
+ *
+ * The checks are in 2 steps, so that unsigned or hostile files cannot cost much CPU time:
+ * - add() does only the cheap checks: base64url, the form of the key (isWellFormedEd25519PublicKey)
+ *   and keyId = hash of the key. It does not import the key into WebCrypto.
+ * - The full check of the key (isAcceptableEd25519PublicKey, about 1 ms) runs lazily, 1 time for each
+ *   public key: in verify() before the WebCrypto import (so at most 1 time for each authorKeyId that
+ *   has an op file), and in isValid(). A key that fails the full check gives 'bad' and is not a valid
+ *   binding. Rule for the app: the domain must call isValidKeyBinding only after authorize accepted
+ *   the item, so that the cost stays low. The replay does not enforce this.
+ * All results are deterministic functions of the data, so all clients agree.
+ */
+export class KeyMap implements KeyBindings {
+  /** keyId → the first binding that passed add(). A keyId is a hash of the key, so there is only 1. */
+  private bindings = new Map<string, { publicKey: string; raw: Uint8Array }>();
+  /** "keyId|publicKey" → the result of add(). */
+  private checked = new Map<string, boolean>();
+  /** public key → the result of the full check. */
+  private full = new Map<string, boolean>();
+  /** keyId → the WebCrypto key (a cached promise). */
+  private imported = new Map<string, Promise<CryptoKey>>();
 
-  get(keyId: string): CryptoKey | undefined {
-    return this.keys.get(keyId);
+  /** True if a binding for this keyId passed add() (the full check can still fail). */
+  has(keyId: string): boolean {
+    return this.bindings.has(keyId);
   }
 
+  /** Adds a binding after the cheap checks. Returns true if the binding passed them. */
   async add(keyId: string, publicKey: string): Promise<boolean> {
     const b = `${keyId}|${publicKey}`;
-    if (this.checked.has(b)) return this.validBindings.has(b);
-    this.checked.add(b);
+    const known = this.checked.get(b);
+    if (known !== undefined) return known;
+    this.checked.set(b, false);
     try {
-      if ((await keyIdFromPublicKey(publicKey)) !== keyId) return false;
-      // The first valid binding wins. A keyId is a hash of the public key, so a second binding cannot be valid.
-      if (!this.keys.has(keyId)) this.keys.set(keyId, await importPublicKey(publicKey));
-      this.validBindings.add(b);
+      const raw = fromB64u(publicKey);
+      if (!isWellFormedEd25519PublicKey(raw) || (await keyIdFromPublicKey(publicKey)) !== keyId) return false;
+      if (!this.bindings.has(keyId)) this.bindings.set(keyId, { publicKey, raw });
+      this.checked.set(b, true);
       return true;
     } catch {
       return false;
     }
   }
 
+  /** The full check of a public key, cached. Sync and deterministic. */
+  private fullOk(publicKey: string, raw: Uint8Array): boolean {
+    let ok = this.full.get(publicKey);
+    if (ok === undefined) this.full.set(publicKey, (ok = isAcceptableEd25519PublicKey(raw)));
+    return ok;
+  }
+
+  /** True if the binding passed add() and the key passes the full check. For the replay (KeyBindings). */
+  isValid(keyId: string, publicKey: string): boolean {
+    const e = this.checked.get(`${keyId}|${publicKey}`) ? this.bindings.get(keyId) : undefined;
+    return !!e && e.publicKey === publicKey && this.fullOk(publicKey, e.raw);
+  }
+
+  /**
+   * Verifies a signature with the key of `keyId`. The only signature check of the engine.
+   * `data` can be a function: then the method computes the data only if it needs it (not for
+   * 'unknown-key' and not for a key that fails the full check).
+   * - No binding for keyId: 'unknown-key'.
+   * - The full check of the key (cached, sync): a fail gives 'bad'. Thus WebCrypto never gets a key
+   *   that is off the curve or not in the prime-order subgroup.
+   * - WebCrypto import (cached): a rejection of the key gives 'bad'.
+   * - verifyBytes (form checks of the signature, then WebCrypto): false gives 'bad'. Else 'ok'.
+   * Errors that are not a WebCrypto rejection (for example of the environment) are thrown again.
+   */
+  async verify(keyId: string, sig: string, data: Uint8Array | (() => Uint8Array)): Promise<SigStatus> {
+    const e = this.bindings.get(keyId);
+    if (!e) return 'unknown-key';
+    if (!this.fullOk(e.publicKey, e.raw)) return 'bad';
+    let p = this.imported.get(keyId);
+    if (!p) {
+      this.imported.set(keyId, (p = importWellFormedPublicKey(e.raw)));
+      // Do not keep an error of the environment: the next call tries again.
+      p.catch((err) => {
+        if (!isWebCryptoRejection(err)) this.imported.delete(keyId);
+      });
+    }
+    let key: CryptoKey;
+    try {
+      key = await p;
+    } catch (err) {
+      if (isWebCryptoRejection(err)) return 'bad';
+      throw err;
+    }
+    return (await verifyBytes(key, sig, typeof data === 'function' ? data() : data)) ? 'ok' : 'bad';
+  }
+
   async addFromTrustRoot(tr: TrustRoot | null): Promise<void> {
     for (const r of tr?.roots ?? []) await this.add(r.keyId, r.publicKey);
   }
 
-  /** Collects keys from ops (any op, valid or not: the binding check makes this safe). */
+  /**
+   * Collects keys from ops (any op, valid or not: the binding check makes this safe). For each op, it
+   * reads only the first MAX_BATCH items (the replay refuses a larger Batch, so other keys cannot be
+   * used) and only the first MAX_BATCH keys, in the order of the items and of keysIn. Thus 1 op cannot
+   * cost much time, also if keysIn returns many keys for 1 item. The limits are deterministic.
+   * A domain must not register more than MAX_BATCH keys in 1 op: the replay result is then
+   * undefined (a later key is valid only if another file registers it).
+   */
   async addFromOps(envs: Iterable<Envelope>, domain: Pick<Domain, 'keysIn'>): Promise<void> {
-    for (const env of envs)
-      for (const it of itemsOf(env)) {
+    for (const env of envs) {
+      let n = 0;
+      for (const it of itemsOf(env).slice(0, MAX_BATCH)) {
         // keysIn gets unsigned, unvalidated data. An error in it ignores this item only.
-        let keys: { keyId: unknown; publicKey: unknown }[] = [];
+        let keys: unknown;
         try {
           keys = domain.keysIn(it);
         } catch {
           continue;
         }
-        for (const k of keys) if (typeof k.keyId === 'string' && typeof k.publicKey === 'string') await this.add(k.keyId, k.publicKey);
+        if (!Array.isArray(keys)) continue;
+        for (const k of keys) {
+          // Each entry counts, also an entry that is not valid: the order of the entries decides.
+          if (n++ >= MAX_BATCH) break;
+          if (typeof k?.keyId === 'string' && typeof k.publicKey === 'string') await this.add(k.keyId, k.publicKey);
+        }
+        if (n >= MAX_BATCH) break;
       }
+    }
   }
 }
 
 export type SigStatus = 'ok' | 'bad' | 'unknown-key';
 
-export async function verifySignature(env: Envelope, keys: KeyMap): Promise<SigStatus> {
-  const k = keys.get(env.authorKeyId);
-  if (!k) return 'unknown-key';
-  return (await verifyBytes(k, env.sig, signingBytes(env))) ? 'ok' : 'bad';
-}
+/**
+ * Verifies the signature of an op. The signing bytes (a canonicalize of the op, up to the size of the
+ * file) are computed only if the key is known: the engine does not cache an 'unknown-key' result.
+ */
+export const verifySignature = (env: Envelope, keys: KeyMap): Promise<SigStatus> => keys.verify(env.authorKeyId, env.sig, () => signingBytes(env));
 
 // ---- Chains ------------------------------------------------------------------------------
 

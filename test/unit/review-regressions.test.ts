@@ -168,7 +168,7 @@ describe('second review regressions', () => {
     await admin.engine.write(admin.signer, 'data', 'Like', { noteId: 'n1' });
     expect(note(admin.engine.state, 'n1').likeCount).toBe(2);
     const meta = { opId: 'p', scope: 'data', authorKeyId: admin.keyId, userId: admin.userId, seq: 1, hlc: { t: 0, c: 0 }, wallTime: '', envType: 'Revert', item: 0 };
-    const plan = planRevert(admin.engine.result, like1.opId, notesDomain, meta, admin.engine.validKeyBindings);
+    const plan = planRevert(admin.engine.result, admin.engine.audit.find((a) => a.opId === like1.opId && a.authorKeyId === user.keyId)!, notesDomain, meta, admin.engine.validKeyBindings);
     if ('error' in plan) throw new Error(plan.error);
     expect(plan.payload.inverse.some((w) => w.f === 'likeCount')).toBe(false);
     await admin.engine.write(admin.signer, 'data', 'Revert', plan.payload);

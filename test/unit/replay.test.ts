@@ -3,10 +3,13 @@
 import { AuthError, SupersededError } from '../../src/engine';
 import { mergeCutoffs } from '../../src/replay';
 import { planRevert } from '../../src/revert';
+import type { AuditEntry } from '../../src/types';
 import { actor, note, rawOp, world } from '../helpers';
 import { notesDomain } from '../notes-domain';
 
 const last = (e: { audit: { status: string; reason?: string; notes: unknown[] }[] }) => e.audit[e.audit.length - 1];
+/** The audit entry of an op (it has the opId and the hash): the target of planRevert. */
+const entryOf = (e: { audit: AuditEntry[] }, env: { opId: string; authorKeyId: string }): AuditEntry => e.audit.find((a) => a.opId === env.opId && a.authorKeyId === env.authorKeyId)!;
 
 describe('plain ops', () => {
   it('applies effects and the derived writes of normalize', async () => {
@@ -125,7 +128,7 @@ describe('Revert', () => {
 
   it('writes the before values and the derived fields', async () => {
     const { admin, edit, meta } = await edited();
-    const plan = planRevert(admin.engine.result, edit.opId, notesDomain, meta, admin.engine.validKeyBindings);
+    const plan = planRevert(admin.engine.result, entryOf(admin.engine, edit), notesDomain, meta, admin.engine.validKeyBindings);
     if ('error' in plan) throw new Error(plan.error);
     expect(plan.overwritten).toEqual([]);
     await admin.engine.write(admin.signer, 'data', 'Revert', plan.payload);
@@ -134,7 +137,7 @@ describe('Revert', () => {
 
   it('rejects a Revert whose inverse is not the before values', async () => {
     const { admin, edit, meta } = await edited();
-    const plan = planRevert(admin.engine.result, edit.opId, notesDomain, meta, admin.engine.validKeyBindings);
+    const plan = planRevert(admin.engine.result, entryOf(admin.engine, edit), notesDomain, meta, admin.engine.validKeyBindings);
     if ('error' in plan) throw new Error(plan.error);
     const forged = { ...plan.payload, inverse: plan.payload.inverse.map((w) => ({ ...w, v: 'any value' })) };
     await expect(admin.engine.write(admin.signer, 'data', 'Revert', forged)).rejects.toThrow('inverse does not match');
@@ -143,7 +146,7 @@ describe('Revert', () => {
   it('removes a created entity with computed fields that are not in the payload', async () => {
     const { admin, user, meta } = await edited();
     const create = user.engine.audit.find((a) => a.type === 'CreateNote')!;
-    const plan = planRevert(admin.engine.result, create.opId, notesDomain, meta, admin.engine.validKeyBindings);
+    const plan = planRevert(admin.engine.result, create, notesDomain, meta, admin.engine.validKeyBindings);
     if ('error' in plan) throw new Error(plan.error);
     expect(plan.payload.inverse).toEqual([{ e: 'note', id: 'n1', f: 'status', v: 'deleted' }]);
     expect(plan.overwritten.map((o) => o.f)).toEqual(['text', 'len']);
@@ -154,7 +157,7 @@ describe('Revert', () => {
   it('is superseded when the domain refuses the removal (entity already deleted)', async () => {
     const { admin, user, meta } = await edited();
     const create = user.engine.audit.find((a) => a.type === 'CreateNote')!;
-    const plan = planRevert(admin.engine.result, create.opId, notesDomain, meta, admin.engine.validKeyBindings);
+    const plan = planRevert(admin.engine.result, create, notesDomain, meta, admin.engine.validKeyBindings);
     if ('error' in plan) throw new Error(plan.error);
     await user.engine.write(user.signer, 'data', 'DeleteNote', { id: 'n1' });
     await admin.engine.scan();
@@ -164,10 +167,10 @@ describe('Revert', () => {
 
   it('can revert a Revert', async () => {
     const { admin, edit, meta } = await edited();
-    const plan = planRevert(admin.engine.result, edit.opId, notesDomain, meta, admin.engine.validKeyBindings);
+    const plan = planRevert(admin.engine.result, entryOf(admin.engine, edit), notesDomain, meta, admin.engine.validKeyBindings);
     if ('error' in plan) throw new Error(plan.error);
     const rev = await admin.engine.write(admin.signer, 'data', 'Revert', plan.payload);
-    const plan2 = planRevert(admin.engine.result, rev.opId, notesDomain, meta, admin.engine.validKeyBindings);
+    const plan2 = planRevert(admin.engine.result, entryOf(admin.engine, rev), notesDomain, meta, admin.engine.validKeyBindings);
     if ('error' in plan2) throw new Error(plan2.error);
     await admin.engine.write(admin.signer, 'data', 'Revert', plan2.payload);
     expect(note(admin.engine.state, 'n1')).toMatchObject({ text: 'second version', len: 14 });
@@ -176,8 +179,8 @@ describe('Revert', () => {
   it('rejects a Revert of a non-revertible op, by a non-admin, or in another scope', async () => {
     const { admin, user, edit, meta } = await edited();
     const grant = admin.engine.audit.find((a) => a.type === 'GrantUser')!;
-    expect(planRevert(admin.engine.result, grant.opId, notesDomain, { ...meta, scope: 'roles' }, admin.engine.validKeyBindings)).toEqual({ error: 'GrantUser cannot be reverted' });
-    const plan = planRevert(admin.engine.result, edit.opId, notesDomain, meta, admin.engine.validKeyBindings);
+    expect(planRevert(admin.engine.result, grant, notesDomain, { ...meta, scope: 'roles' }, admin.engine.validKeyBindings)).toEqual({ error: 'GrantUser cannot be reverted' });
+    const plan = planRevert(admin.engine.result, entryOf(admin.engine, edit), notesDomain, meta, admin.engine.validKeyBindings);
     if ('error' in plan) throw new Error(plan.error);
     await expect(user.engine.write(user.signer, 'data', 'Revert', plan.payload)).rejects.toThrow('only admins can revert');
     await expect(admin.engine.write(admin.signer, 'roles', 'Revert', plan.payload)).rejects.toThrow('scope of its target');
@@ -237,16 +240,5 @@ describe('order and clocks', () => {
     await admin.engine.write(admin.signer, 'data', 'CreateNote', { id: 'n2', text: 'b' });
     const flagged = admin.engine.issues.filter((i) => i.kind === 'future-clock');
     expect(flagged.map((i) => i.authorKeyId)).toEqual([user.keyId]);
-  });
-
-  it('rejects a second op with the same opId', async () => {
-    const { storage, admin, user } = await world();
-    const t = Date.parse('2026-02-01T00:00:00Z');
-    await rawOp(storage, user, 'data', 'CreateNote', { id: 'n1', text: 'a' }, { t, c: 0 }, undefined, 'same-op-id');
-    await rawOp(storage, admin, 'data', 'CreateNote', { id: 'n2', text: 'b' }, { t: t + 1, c: 0 }, undefined, 'same-op-id');
-    await admin.engine.scan();
-    expect(note(admin.engine.state, 'n1')).toBeDefined();
-    expect(note(admin.engine.state, 'n2')).toBeUndefined();
-    expect(admin.engine.issues.some((i) => i.detail.includes('duplicate opId'))).toBe(true);
   });
 });

@@ -6,6 +6,8 @@
 // - Pure and deterministic. No Date.now(), no randomness, no locale-dependent
 //   logic, no dependence on the iteration order of a Map or an object.
 // - They read the state, but never change it. The replay applies the writes.
+// - Read the state with own-property checks (ctx.get, ctx.getIn, ctx.list do this).
+//   A name such as "constructor" must never find a member of Object.prototype.
 
 import type { Hlc } from './hlc';
 import type { Storage } from './storage/types';
@@ -22,6 +24,7 @@ export const hasOp = (catalog: Record<string, OpDef>, type: string): boolean => 
 
 /** The op that the replay applies now, as the domain sees it. */
 export interface OpMeta {
+  /** Unique only for 1 author key. 2 authors can use the same opId. */
   opId: string;
   scope: string;
   authorKeyId: string;
@@ -49,14 +52,19 @@ export interface EffectCtx {
    * for the same set of ops, but do not give it a meaning. Sort if the order matters.
    */
   list(e: string, scope?: string): Entity[];
-  /** True if verify.ts checked that keyId is the hash of publicKey. */
+  /**
+   * True if verify.ts checked that keyId is the hash of publicKey and that publicKey is an acceptable
+   * Ed25519 key (the full check, about 1 ms, 1 time for each key). Rule for the app: call it only
+   * after authorize accepted the item, so that the cost stays low. The replay does not enforce this.
+   */
   isValidKeyBinding(keyId: string, publicKey: string): boolean;
   /**
    * Only for a Revert: the target op, if it is an applied op before the Revert, in the
-   * scope of the Revert, with the hash of the payload. Else undefined (then the replay
-   * rejects the Revert after `authorize`). Read-only: a frozen, shallow copy. The values
-   * `v` and `before` of the writes are the same objects as in the replay and in the state.
-   * The domain must not change them.
+   * scope of the Revert, with the hash and the opId of the payload. The replay finds the
+   * target by its hash, because an opId is unique only for 1 author key. Else undefined
+   * (then the replay rejects the Revert after `authorize`). Read-only: a frozen, shallow
+   * copy. The values `v` and `before` of the writes are the same objects as in the replay
+   * and in the state. The domain must not change them.
    */
   revertTarget?: RevertTarget;
 }
@@ -161,6 +169,7 @@ export interface Domain {
   rootState(trustRoot: TrustRoot | null): State;
   /**
    * User ID of a known key at this point of the order, or null for an unknown key.
+   * The replay rejects the op of a key for which the result is not a string.
    * An error during the replay rejects the op. An error during the checkpoint check
    * makes the pack untrusted (the engine reads the op files).
    */
@@ -168,7 +177,9 @@ export interface Domain {
   /**
    * Keys (keyId and public key) that an op item registers. verify.ts checks the binding.
    * Called for ALL op files before any check: the payload is unsigned and not validated.
-   * An error ignores the item.
+   * An error ignores the item. At most MAX_BATCH keys of each op count, in the order of the items.
+   * A domain must not register more than MAX_BATCH keys in 1 op: the replay result is then
+   * undefined (a later key is valid only if another file registers it).
    */
   keysIn(item: OpItem): { keyId: string; publicKey: string }[];
   /**

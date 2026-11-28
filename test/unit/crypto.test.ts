@@ -3,6 +3,7 @@
 import {
   decryptJson, encryptJson, fingerprint, generateAesKey, generateSigningKey, importPublicKey, keyIdFromPublicKey,
   signBytes, unwrapAesKey, unwrapSigningKey, verifyBytes, wrapAesKey, wrapSigningKey, WrongPassphraseError, deriveKek, newKdfParams,
+  PBKDF2_MIN_ITERATIONS,
 } from '../../src/crypto';
 import { b64u, base32, fromB64u, utf8 } from '../../src/encoding';
 import { nameUuid, uuidv7 } from '../../src/ids';
@@ -54,8 +55,8 @@ describe('Ed25519 signatures', () => {
 describe('key file wrapping', () => {
   it('wraps with a passphrase and unwraps into a non-extractable key', async () => {
     const k = await generateSigningKey();
-    const file = await wrapSigningKey(k, 'správné heslo', 'Test User', new Date('2026-01-01T00:00:00Z'), 'test-key', 1000);
-    expect(file.kdf.iterations).toBe(1000);
+    const file = await wrapSigningKey(k, 'správné heslo', 'Test User', new Date('2026-01-01T00:00:00Z'), 'test-key', PBKDF2_MIN_ITERATIONS);
+    expect(file.kdf.iterations).toBe(PBKDF2_MIN_ITERATIONS);
     expect(JSON.stringify(file)).not.toContain('PRIVATE');
     const { privateKey } = await unwrapSigningKey(file, 'správné heslo', 'test-key');
     expect(privateKey.extractable).toBe(false);
@@ -67,7 +68,7 @@ describe('key file wrapping', () => {
 
   it('does not accept the key file of another app', async () => {
     const k = await generateSigningKey();
-    const file = await wrapSigningKey(k, 'p', 'n', new Date(), 'app-a-key', 1000);
+    const file = await wrapSigningKey(k, 'p', 'n', new Date(), 'app-a-key', PBKDF2_MIN_ITERATIONS);
     await expect(unwrapSigningKey(file, 'p', 'app-b-key')).rejects.toThrow('unsupported key file');
   });
 
@@ -78,7 +79,7 @@ describe('key file wrapping', () => {
   });
 
   it('cache key wrap and AES-GCM JSON encryption', async () => {
-    const kek = await deriveKek('heslo', newKdfParams(1000));
+    const kek = await deriveKek('heslo', newKdfParams(PBKDF2_MIN_ITERATIONS));
     const ck = await generateAesKey();
     const w = await wrapAesKey(ck, kek);
     const ck2 = await unwrapAesKey(w, kek);

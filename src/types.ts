@@ -88,6 +88,7 @@ export type IssueKind =
   | 'invalid-payload'
   | 'future-clock'
   | 'bad-checkpoint'
+  | 'trust-root' // the trust root is not readable or not valid (the engine uses the last good copy), or it changed
   | 'domain'; // an issue that the domain reports
 
 export interface Issue {
@@ -137,8 +138,11 @@ export interface AuditEntry {
   code?: string;
   writes: AppliedWrite[];
   notes: ItemNote[];
-  /** For Batch: the item types. For Revert: the target op ID. */
+  /** For Batch: the item types. For Revert: ['Revert']. */
   itemTypes?: string[];
+  /** For Revert: the op ID of the target. An op ID is unique only for 1 author key. Use `revertOfHash` to find the target. */
   revertOf?: string;
+  /** For Revert: the hash of the target op. It identifies the target. */
+  revertOfHash?: string;
   payload: Record<string, unknown>;
 }

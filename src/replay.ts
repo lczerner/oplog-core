@@ -30,15 +30,28 @@ export interface ReplayResult {
   state: State;
   audit: AuditEntry[];
   issues: Issue[];
+  /**
+   * The applied ops, by the hash of the op (not by the opId: an opId is unique only
+   * for 1 author key, so 2 authors can use the same opId).
+   */
   applied: Map<string, AppliedInfo>;
   cutoffs: Map<string, Cutoff>;
 }
 
+/** The key bindings that the replay can use (EffectCtx.isValidKeyBinding). KeyMap in verify.ts implements it. */
+export interface KeyBindings {
+  /** True if publicKey is a valid key for keyId (sync and deterministic). */
+  isValid(keyId: string, publicKey: string): boolean;
+}
+
+/** No valid key binding. For tests and tools. */
+export const NO_KEY_BINDINGS: KeyBindings = { isValid: () => false };
+
 export interface ReplayOptions {
   domain: Domain;
   trustRoot: TrustRoot | null;
-  /** keyId|publicKey pairs checked by verify.ts. */
-  validKeyBindings: Set<string>;
+  /** The key bindings checked by verify.ts (KeyMap). */
+  validKeyBindings: KeyBindings;
 }
 
 // An empty Batch is rejected: it would skip authorize (a user without rights would get no-effect, not a rejection).
@@ -80,6 +93,7 @@ export function replayFull(ops: VerifiedOp[], opts: ReplayOptions): Replayer {
       found = opts.domain.revocations(res.state);
     } catch (e) {
       res.issues.push({ kind: 'domain', detail: `revocations: internal error: ${e instanceof Error ? e.message : String(e)}` });
+      res.endIssue = true;
       return res;
     }
     const next = mergeCutoffs(rootCut, found);
@@ -88,6 +102,7 @@ export function replayFull(ops: VerifiedOp[], opts: ReplayOptions): Replayer {
     res = replayOnce(sorted, opts, cutoffs);
   }
   res.issues.push({ kind: 'unauthorized', detail: `revocation cutoffs did not become stable after ${MAX_FIXPOINT} rounds` });
+  res.endIssue = true;
   return res;
 }
 
@@ -147,9 +162,14 @@ export function getEntity(state: State, scope: string, e: string, id: string): E
   return s[scope][e][id];
 }
 
+/**
+ * The table of an entity type. Makes the scope and the table if they do not exist.
+ * Own-property checks only: a scope or a type such as "constructor" must not find a
+ * prototype member (for example the global `Object`) and write into it.
+ */
 function table(state: State, scope: string, e: string): Record<string, Entity> {
-  const s = (state.scopes[scope] ??= {});
-  return (s[e] ??= {});
+  const s = has(state.scopes, scope) ? state.scopes[scope] : (state.scopes[scope] = {});
+  return has(s, e) ? s[e] : (s[e] = {});
 }
 
 interface JournalEntry {
@@ -206,14 +226,14 @@ function touchesRoot(state: State, scope: string, writes: Write[]): boolean {
   return false;
 }
 
-export function makeCtx(state: State, op: OpMeta, validKeyBindings: Set<string>): EffectCtx {
+export function makeCtx(state: State, op: OpMeta, validKeyBindings: KeyBindings): EffectCtx {
   return {
     op,
     state,
     get: (e, id) => getEntity(state, op.scope, e, id),
     getIn: (scope, e, id) => getEntity(state, scope, e, id),
     list: (e, scope = op.scope) => (has(state.scopes, scope) && has(state.scopes[scope], e) ? Object.values(state.scopes[scope][e]) : []),
-    isValidKeyBinding: (k, p) => validKeyBindings.has(`${k}|${p}`),
+    isValidKeyBinding: (k, p) => validKeyBindings.isValid(k, p),
   };
 }
 
@@ -306,10 +326,24 @@ export class Replayer {
   readonly state: State;
   readonly audit: AuditEntry[] = [];
   readonly issues: Issue[] = [];
+  /** The applied ops, by the hash of the op. */
   readonly applied = new Map<string, AppliedInfo>();
-  private readonly seenOpIds = new Set<string>();
+  /** The opIds of all ops before this point (also of rejected ops), for each author key. */
+  private readonly seenOpIds = new Map<string, Set<string>>();
+  /** The highest HLC time of the earlier ops that the replay did not reject or rejected only because of a revocation cutoff. */
   private maxT = 0;
   last: Envelope | null = null;
+  /**
+   * True if replayFull() added an issue after the last op (revocations failed or did not become
+   * stable). Then the issues of later ops would come after it, but a full replay puts them before
+   * it. Thus the caller must not apply more ops or take back ops: it must do a full replay.
+   */
+  endIssue = false;
+  /**
+   * The ops at the end of the order that the replay rejected (the longest such tail), with what
+   * the run of each op changed. takeBackRejected() uses it to undo these runs exactly.
+   */
+  private tail: { op: VerifiedOp; before: Envelope | null; maxT: number; addedOpId: boolean; issues: Issue[] }[] = [];
 
   constructor(
     private readonly opts: ReplayOptions,
@@ -326,6 +360,41 @@ export class Replayer {
     const entry = this.run(op, false);
     this.last = op.env;
     return entry;
+  }
+
+  /**
+   * The ops at the end of the order that the replay rejected, in order. `before` is the last op
+   * before the op (null if there is none).
+   */
+  rejectedTail(): { op: VerifiedOp; before: Envelope | null }[] {
+    return this.tail.map((t) => ({ op: t.op, before: t.before }));
+  }
+
+  /**
+   * Takes back the last `n` ops of rejectedTail() and returns them in order. After this, the
+   * Replayer is the same as if these ops never ran: the audit log, the issues, the opIds, maxT and
+   * `last` are as before them. A rejected op does not change the state or `applied`. The caller
+   * can then apply new ops and these ops again, in the total order: the result is the same as a
+   * full replay with the same cutoffs.
+   */
+  takeBackRejected(n: number): VerifiedOp[] {
+    if (!Number.isSafeInteger(n) || n < 0 || n > this.tail.length) throw new Error(`takeBackRejected: ${n} is not in 0..${this.tail.length}`);
+    const out = this.tail.splice(this.tail.length - n, n);
+    for (let i = out.length - 1; i >= 0; i--) {
+      const t = out[i];
+      this.audit.pop();
+      // Remove the issues of this run. Each issue object is unique. replayFull can add issues after
+      // the last op, thus remove by identity and not by position.
+      for (let k = t.issues.length - 1; k >= 0; k--) {
+        const at = this.issues.lastIndexOf(t.issues[k]);
+        if (at >= 0) this.issues.splice(at, 1);
+      }
+      // Remove the opId only if this run added it (a duplicate opId was there before).
+      if (t.addedOpId) this.seenOpIds.get(t.op.env.authorKeyId)?.delete(t.op.env.opId);
+      this.maxT = t.maxT;
+      this.last = t.before;
+    }
+    return out.map((t) => t.op);
   }
 
   /**
@@ -360,19 +429,23 @@ export class Replayer {
 
     if (!dry) {
       // Deterministic future-clock check: the HLC is far after the op's own wall time,
-      // and greater than all HLCs before it. Honest clients only copy such an HLC.
+      // and greater than maxT (the HLCs of the earlier ops that count, see below).
+      // Honest clients only copy such an HLC.
       const wall = isIso(env.wallTime) ? Date.parse(env.wallTime) : NaN;
       if (Number.isFinite(wall) && env.hlc.t > wall + FUTURE_CLOCK_MS && env.hlc.t > this.maxT)
         issue('future-clock', `HLC is ${Math.round((env.hlc.t - wall) / 60_000)} minutes after the wall time of the op`);
-      if (env.hlc.t > this.maxT) this.maxT = env.hlc.t;
     }
 
     const journal: JournalEntry[] = [];
+    const ownIds = this.seenOpIds.get(env.authorKeyId);
+    let rejectKind: Issue['kind'] | null = null;
     try {
-      if (this.seenOpIds.has(env.opId)) throw new Reject('invalid-payload', 'duplicate opId');
+      // An opId is unique only for 1 author key. Thus a copied opId of another author
+      // cannot cancel an op: an author can only hurt own ops.
+      if (ownIds?.has(env.opId)) throw new Reject('invalid-payload', 'duplicate opId');
       if (domain.scopeDir(env.scope) === null) throw new Reject('invalid-payload', 'invalid scope');
       const userId = domain.keyOwner(state, env.authorKeyId);
-      if (userId === null) throw new Reject('unauthorized', 'unknown key');
+      if (typeof userId !== 'string') throw new Reject('unauthorized', 'unknown key');
       entry.userId = userId;
       const cut = this.cutoffs.get(env.authorKeyId);
       if (cut && env.seq > cutoffFor(cut, env.scope)) throw new Reject('revoked', `key revoked after seq ${cutoffFor(cut, env.scope)} in ${env.scope}`);
@@ -384,6 +457,7 @@ export class Replayer {
       // An error in domain code rejects this op only. It must not block the replay for all clients.
       const e = err instanceof Reject ? err : new Reject('domain', `internal error: ${err instanceof Error ? err.message : String(err)}`);
       undo(state, journal, 0);
+      rejectKind = e.kind;
       entry.status = 'rejected';
       entry.reason = e.reason;
       entry.writes = [];
@@ -395,11 +469,23 @@ export class Replayer {
       undo(state, journal, 0);
       return entry;
     }
-    this.seenOpIds.add(env.opId);
+    const addedOpId = !ownIds?.has(env.opId);
+    const maxTBefore = this.maxT;
+    if (ownIds) ownIds.add(env.opId);
+    else this.seenOpIds.set(env.authorKeyId, new Set([env.opId]));
+    // maxT grows from ops that the replay did not reject. It also grows from ops that only a
+    // revocation cutoff rejects: before the revocation, honest clients applied such an op and
+    // copied its HLC, so their later ops must not become future-clock ops. Other rejected ops
+    // (for example of a key that nobody granted) do not move maxT. Else they can hide the
+    // future clock of a later op.
+    if ((rejectKind === null || rejectKind === 'revoked') && env.hlc.t > this.maxT) this.maxT = env.hlc.t;
     this.audit.push(entry);
     this.issues.push(...issues);
+    // run() runs before apply() sets `last`: this.last is the op before this op.
+    if (entry.status === 'rejected') this.tail.push({ op: { env, hash }, before: this.last, maxT: maxTBefore, addedOpId, issues });
+    else this.tail = [];
     if (entry.status === 'applied')
-      this.applied.set(env.opId, {
+      this.applied.set(hash, {
         opId: env.opId,
         hash,
         scope: env.scope,
@@ -481,12 +567,14 @@ export class Replayer {
     if (e) throw new Reject('invalid-payload', e);
     const p = env.payload as { target: { opId: string; hash: string }; inverse: Write[] };
     entry.revertOf = p.target.opId;
+    entry.revertOfHash = p.target.hash;
     entry.itemTypes = [REVERT];
     const ctx = makeCtx(this.state, meta, validKeyBindings);
     // Find the target before authorize, so that authorize can see it (for example its author).
     // The order of the rejections does not change: authorize first, then the target checks.
-    const target = this.applied.get(p.target.opId);
-    const found = !!target && target.hash === p.target.hash;
+    // The hash identifies the target. The opId of the payload must be the opId of that op.
+    const target = this.applied.get(p.target.hash);
+    const found = !!target && target.opId === p.target.opId;
     if (found && target.scope === env.scope) ctx.revertTarget = revertTargetOf(target);
     const a = domain.authorize({ type: REVERT, payload: p }, ctx);
     if (!a.ok) throw new Reject('unauthorized', a.reason);

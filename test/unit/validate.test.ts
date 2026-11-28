@@ -16,7 +16,7 @@ describe('validator', () => {
     expect(checkValue('a\nb', { text: 20 }, 'p')).toMatch('control');
     expect(checkValue('a\nb\tc', { text: 20, multiline: true }, 'p')).toBeNull();
     expect(checkValue('a\u0007b', { text: 20, multiline: true }, 'p')).toMatch('control');
-    expect(checkValue('a b', { text: 20, multiline: true }, 'p')).toMatch('control');
+    expect(checkValue('a\u2028b', { text: 20, multiline: true }, 'p')).toMatch('control');
   });
 
   it('checks URLs by scheme', () => {

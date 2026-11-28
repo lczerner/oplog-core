@@ -160,7 +160,8 @@ describe('parallel quick scan', () => {
     const { storage, admin, user, clock } = await world();
     for (let i = 0; i < 3; i++) await user.engine.write(user.signer, 'data', 'CreateNote', { id: `u${i}`, text: 'u' });
     await admin.engine.write(admin.signer, 'data', 'CreateNote', { id: 'a0', text: 'a' });
-    // A file with an issue that the engine knows before the poll: the quick scan skips its number.
+    // A file with a parse error that the engine knows before the poll: the quick scan reads it again
+    // (it can be a partial read) and gets the same issue.
     await storage.writeNew(filePath('data', 'ops', user.keyId, 6), 'garbage known');
     const e = new Engine(storage, notesDomain, { now: clock.now });
     await e.scan();
@@ -269,17 +270,48 @@ describe('quick scan look-ahead (regression)', () => {
     expect(found).toEqual([filePath('data', 'ops', user.keyId, 9), filePath('data', 'ops', user.keyId, 26)]);
   });
 
-  it('does not read a path with a known issue again', async () => {
+  it('reads a known file again only if its issue is "not valid JSON" (a partial read)', async () => {
     const { storage, user, clock, reads, s } = await headAt7();
-    const bad = filePath('data', 'ops', user.keyId, 8);
-    await storage.writeNew(bad, 'garbage 8');
+    // seq 8: a copy of op 1 (misplaced). seq 9: valid JSON, not an envelope (schema error).
+    // seq 10: garbage (not valid JSON, can be a partial read).
+    const p = (n: number) => filePath('data', 'ops', user.keyId, n);
+    await storage.writeNew(p(8), (await storage.read(p(1)))!);
+    await storage.writeNew(p(9), '{}');
+    await storage.writeNew(p(10), 'garbage 10');
     const e = new Engine(s, notesDomain, { now: clock.now });
     await e.scan();
-    expect(e.issues.some((i) => i.path === bad)).toBe(true);
+    expect([8, 9, 10].map((n) => e.issues.find((i) => i.path === p(n))?.kind)).toEqual(['misplaced', 'parse-error', 'parse-error']);
+    reads.clear();
+    expect(await e.scan('quick')).toBe(false);
+    expect(reads.get(p(8))).toBeUndefined();
+    expect(reads.get(p(9))).toBeUndefined();
+    expect(reads.get(p(10))).toBe(1);
+    // The scan reads on after the known numbers.
+    expect(reads.get(p(11))).toBe(1);
+    // The partial file changes to a schema error: the issue list updates.
+    storage.files.set(p(10), '{}');
+    expect(await e.scan('quick')).toBe(true);
+    expect(e.issues.find((i) => i.path === p(10))?.detail).not.toBe('not valid JSON');
     reads.clear();
     await e.scan('quick');
-    expect(reads.get(bad)).toBeUndefined();
-    // The scan reads on after the known number.
-    expect(reads.get(filePath('data', 'ops', user.keyId, 9))).toBe(1);
+    expect(reads.get(p(10))).toBeUndefined();
+  });
+
+  it('reads at most 16 known "not valid JSON" files again for each author in 1 quick scan', async () => {
+    const { storage, user, clock, reads, s } = await headAt7();
+    const p = (n: number) => filePath('data', 'ops', user.keyId, n);
+    for (let n = 8; n < 48; n++) await storage.writeNew(p(n), `garbage ${n}`);
+    const e = new Engine(s, notesDomain, { now: clock.now });
+    await e.scan();
+    // The author writes on after the garbage.
+    await user.engine.scan();
+    const env = await user.engine.write(user.signer, 'data', 'CreateNote', { id: 'late', text: 't' });
+    expect(env.seq).toBe(48);
+    reads.clear();
+    expect(await e.scan('quick')).toBe(true);
+    const rereads = [...Array(40).keys()].map((i) => p(8 + i)).filter((k) => reads.has(k));
+    expect(rereads.length).toBe(16);
+    // The known files do not start the look-ahead again, and the scan finds the new op after them.
+    expect(note(e.state, 'late')).toBeDefined();
   });
 });

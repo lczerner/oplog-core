@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026, Lukáš Czerner <lukas@czerner.cz>
 // File System Access adapter (browser). Works on the locally synced OneDrive folder.
-import { checkPath, FileExistsError, type DirEntry, type Storage } from './types';
+import { checkMaxBytes, checkPath, FileExistsError, FileTooLargeError, type DirEntry, type ReadOptions, type Storage } from './types';
 
 type Dir = FileSystemDirectoryHandle;
 
@@ -44,16 +44,35 @@ export class FsaStorage implements Storage {
     }
   }
 
-  async read(path: string): Promise<string | null> {
+  /**
+   * Reads the content of a file. A File object is a snapshot: if the file changes after
+   * getFile(), arrayBuffer() fails. Thus File.size is the size of the content that the read gives.
+   */
+  private async readRaw(path: string, opts?: ReadOptions): Promise<Uint8Array | null> {
     checkPath(path);
+    checkMaxBytes(opts?.maxBytes);
     const f = await this.file(path);
-    return f ? f.text() : null;
+    if (!f) return null;
+    const max = opts?.maxBytes;
+    if (max !== undefined && f.size > max) throw new FileTooLargeError(path, max);
+    let b: Uint8Array;
+    try {
+      b = new Uint8Array(await f.arrayBuffer());
+    } catch {
+      return null;
+    }
+    if (max !== undefined && b.length > max) throw new FileTooLargeError(path, max);
+    return b;
   }
 
-  async readBytes(path: string): Promise<Uint8Array | null> {
-    checkPath(path);
-    const f = await this.file(path);
-    return f ? new Uint8Array(await f.arrayBuffer()) : null;
+  /** Decodes like File.text(): UTF-8, and the decoder removes a BOM. */
+  async read(path: string, opts?: ReadOptions): Promise<string | null> {
+    const b = await this.readRaw(path, opts);
+    return b && new TextDecoder().decode(b);
+  }
+
+  readBytes(path: string, opts?: ReadOptions): Promise<Uint8Array | null> {
+    return this.readRaw(path, opts);
   }
 
   async remove(path: string): Promise<boolean> {
@@ -108,9 +127,22 @@ export class FsaStorage implements Storage {
       if (e instanceof FileExistsError) throw e;
       // NotFoundError: good, the file does not exist.
     }
+    // getFileHandle() with `create` makes an empty file at once. If the write fails, the empty
+    // file stays. The adapter does not delete it. Between the failure and a delete by path,
+    // a different writer can put its op at this path. Examples are OneDrive on a different
+    // computer, a second browser profile and a write without the Web Lock. The delete then
+    // removes that op. For op and checkpoint files, the engine skips an empty or partial file.
+    // For a file at a fixed path, the caller must read the file and check its content.
     const fh = await d.getFileHandle(name, { create: true });
-    const w = await fh.createWritable({ keepExistingData: false });
-    await w.write(data.slice().buffer as ArrayBuffer);
-    await w.close();
+    let w: FileSystemWritableFileStream | undefined;
+    try {
+      w = await fh.createWritable({ keepExistingData: false });
+      await w.write(data.slice().buffer as ArrayBuffer);
+      await w.close();
+    } catch (e) {
+      // abort() discards the data of the writable. Ignore its errors: the original error is more important.
+      if (w) await w.abort().catch(() => {});
+      throw e;
+    }
   }
 }
