@@ -8,7 +8,7 @@ import { importPublicKey, keyIdFromPublicKey, verifyBytes } from './crypto';
 import { utf8 } from './encoding';
 import { ENROLL_DIR } from './paths';
 import type { Storage } from './storage/types';
-import { isIso, isPlainObject } from './validate';
+import { isIso, isPlainObject, isValidDisplayName } from './validate';
 
 export interface EnrollmentRequest {
   format: string;
@@ -34,7 +34,12 @@ export const slug = (s: string): string =>
 
 export const enrollmentPath = (displayName: string, keyId: string): string => `${ENROLL_DIR}/${slug(displayName)}-${keyId.slice(1, 9)}.json`;
 
+/** The maximum size of an enrollment file in bytes. listEnrollments does not read a larger file. */
+export const MAX_ENROLLMENT_BYTES = 64 * 1024;
+
+/** Makes a self-signed request. Throws if the display name is not valid (isValidDisplayName). */
 export async function createEnrollment(format: string, displayName: string, keyId: string, publicKey: string, now: Date, sign: (b: Uint8Array) => Promise<string>): Promise<EnrollmentRequest> {
+  if (!isValidDisplayName(displayName)) throw new Error('invalid display name');
   const rest = { format, v: 1 as const, displayName, keyId, alg: 'Ed25519' as const, publicKey, createdAt: now.toISOString() };
   return { ...rest, sig: await sign(utf8(canonicalize(rest))) };
 }
@@ -42,7 +47,7 @@ export async function createEnrollment(format: string, displayName: string, keyI
 export async function verifyEnrollment(r: EnrollmentRequest, format: string): Promise<boolean> {
   try {
     if (!isPlainObject(r) || r.format !== format || r.v !== 1 || r.alg !== 'Ed25519') return false;
-    if (typeof r.displayName !== 'string' || !r.displayName.trim() || r.displayName.length > 200) return false;
+    if (!isValidDisplayName(r.displayName)) return false;
     if (typeof r.keyId !== 'string' || typeof r.publicKey !== 'string' || typeof r.sig !== 'string' || !isIso(r.createdAt)) return false;
     if ((await keyIdFromPublicKey(r.publicKey)) !== r.keyId) return false;
     const { sig, ...rest } = r;
@@ -59,7 +64,10 @@ export interface EnrollmentEntry {
   valid: boolean;
 }
 
-/** All requests in enroll/. Names with characters that the storage refuses are skipped. */
+/**
+ * All requests in enroll/. Names with characters that the storage refuses are skipped.
+ * A file that is larger than MAX_ENROLLMENT_BYTES, or that the storage cannot read, gives an invalid entry.
+ */
 export async function listEnrollments(storage: Storage, format: string): Promise<EnrollmentEntry[]> {
   const out: EnrollmentEntry[] = [];
   for (const f of (await storage.list(ENROLL_DIR)) ?? []) {
@@ -67,9 +75,9 @@ export async function listEnrollments(storage: Storage, format: string): Promise
     const path = `${ENROLL_DIR}/${f.name}`;
     let data: unknown = null;
     try {
-      data = JSON.parse((await storage.read(path)) ?? '');
+      data = JSON.parse((await storage.read(path, { maxBytes: MAX_ENROLLMENT_BYTES })) ?? '');
     } catch {
-      /* invalid */
+      /* invalid: FileTooLargeError, a read error or bad JSON */
     }
     const valid = await verifyEnrollment(data as EnrollmentRequest, format);
     out.push({ path, request: valid ? (data as EnrollmentRequest) : null, valid });

@@ -12,6 +12,8 @@ import { fakeClock, makeKey, note, world, writeTrustRoot } from '../helpers';
 import { notesDomain, teamNotesDomain } from '../notes-domain';
 
 const last = (e: Engine): AuditEntry => e.audit[e.audit.length - 1];
+/** The audit entry of an op (it has the opId and the hash): the target of planRevert. */
+const entryOf = (e: { audit: AuditEntry[] }, env: { opId: string; authorKeyId: string }): AuditEntry => e.audit.find((a) => a.opId === env.opId && a.authorKeyId === env.authorKeyId)!;
 
 /** A root admin and a granted user, with engines of the given domain. */
 async function domainWorld(domain: Domain) {
@@ -113,7 +115,7 @@ describe('EffectCtx.revertTarget', () => {
   it('lets authorize see the target: a user reverts an own CreateNote', async () => {
     const { user } = await world();
     const create = await user.engine.write(user.signer, 'data', 'CreateNote', { id: 'n1', text: 'mine' });
-    const plan = planRevert(user.engine.result, create.opId, notesDomain, metaOf(user), user.engine.validKeyBindings);
+    const plan = planRevert(user.engine.result, entryOf(user.engine, create), notesDomain, metaOf(user), user.engine.validKeyBindings);
     if ('error' in plan) throw new Error(plan.error);
     expect(user.engine.check(user.keyId, 'data', 'Revert', plan.payload).status).toBe('applied');
     await user.engine.write(user.signer, 'data', 'Revert', plan.payload);
@@ -127,7 +129,7 @@ describe('EffectCtx.revertTarget', () => {
     const other = await admin.engine.write(admin.signer, 'data', 'CreateNote', { id: 'n2', text: 'admin' });
     await user.engine.scan();
     for (const t of [edit, other]) {
-      const plan = planRevert(user.engine.result, t.opId, notesDomain, metaOf(user), user.engine.validKeyBindings);
+      const plan = planRevert(user.engine.result, entryOf(user.engine, t), notesDomain, metaOf(user), user.engine.validKeyBindings);
       if ('error' in plan) throw new Error(plan.error);
       await expect(user.engine.write(user.signer, 'data', 'Revert', plan.payload)).rejects.toThrow('only admins can revert');
     }
@@ -139,7 +141,7 @@ describe('EffectCtx.revertTarget', () => {
     const create = await user.engine.write(user.signer, 'data', 'CreateNote', { id: 'n1', text: 'mine' });
     const e = new Engine(storage, domain, { now: clock.now });
     await e.scan();
-    const plan = planRevert(e.result, create.opId, domain, metaOf(user), e.validKeyBindings);
+    const plan = planRevert(e.result, entryOf(e, create), domain, metaOf(user), e.validKeyBindings);
     if ('error' in plan) throw new Error(plan.error);
     expect(seen.map((s) => s.fn)).toEqual(['removeWrites']);
     seen.length = 0;
@@ -151,7 +153,7 @@ describe('EffectCtx.revertTarget', () => {
     expect(t.writes.map((w) => w.f)).toEqual(['text', 'author', 'status', 'len']);
     expect(Object.isFrozen(t) && Object.isFrozen(t.itemTypes) && Object.isFrozen(t.writes) && Object.isFrozen(t.writes[0])).toBe(true);
     // The copy does not share arrays with the replay.
-    expect(t.writes).not.toBe(e.result.applied.get(create.opId)!.writes);
+    expect(t.writes).not.toBe(e.result.applied.get(entryOf(e, create).hash)!.writes);
     expect(seen[1].target).toEqual(t);
   });
 
@@ -161,7 +163,8 @@ describe('EffectCtx.revertTarget', () => {
     const create = await admin.engine.write(admin.signer, 'data', 'CreateNote', { id: 'n1', text: 'a' });
     const e = new Engine(storage, domain, { now: clock.now });
     await e.scan();
-    const hash = e.result.applied.get(create.opId)!.hash;
+    const hash = entryOf(e, create).hash;
+    expect(e.result.applied.get(hash)?.opId).toBe(create.opId);
     const r1 = e.check(admin.keyId, 'data', 'Revert', { target: { opId: 'nope', hash }, inverse: [] });
     const r2 = e.check(admin.keyId, 'data', 'Revert', { target: { opId: create.opId, hash: 'sha256:00' }, inverse: [] });
     const r3 = e.check(admin.keyId, 'roles', 'Revert', { target: { opId: create.opId, hash }, inverse: [] });
@@ -257,7 +260,7 @@ describe('the code of a superseded result', () => {
     const create = await user.engine.write(user.signer, 'data', 'CreateNote', { id: 'n1', text: 'a' });
     await admin.engine.scan();
     const meta = { opId: 'plan', scope: 'data', authorKeyId: admin.keyId, userId: admin.userId, seq: 1, hlc: { t: 0, c: 0 }, wallTime: '', envType: 'Revert', item: 0 };
-    const plan = planRevert(admin.engine.result, create.opId, notesDomain, meta, admin.engine.validKeyBindings);
+    const plan = planRevert(admin.engine.result, entryOf(admin.engine, create), notesDomain, meta, admin.engine.validKeyBindings);
     if ('error' in plan) throw new Error(plan.error);
     await user.engine.write(user.signer, 'data', 'DeleteNote', { id: 'n1' });
     await admin.engine.scan();

@@ -4,9 +4,8 @@
 //  - New entities: UUIDv7 (time-ordered + random).
 //  - Name-based IDs: UUID version 8 from SHA-256("<type>|<key>"), for imports of an app.
 
-import { hex } from './encoding';
 import { randomBytes, sha256 } from './crypto';
-import { utf8 } from './encoding';
+import { hex, utf8 } from './encoding';
 
 function format(b: Uint8Array): string {
   const h = hex(b);

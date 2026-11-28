@@ -51,16 +51,97 @@ export const isDate = (v: unknown): v is string => typeof v === 'string' && DATE
 export const isIso = (v: unknown): v is string => typeof v === 'string' && ISO_RE.test(v) && calendarOk(v);
 export const isHex64 = (v: unknown): v is string => typeof v === 'string' && HEX64_RE.test(v);
 
-/** True if `v` is an absolute URL with one of the schemes. Uses no network and no DOM. */
+// White space that the regex class \s matches, as an explicit list. The result of \s depends on the
+// Unicode version of the JS engine. This list does not.
+const WS_CHARS = '\\t\\n\\v\\f\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff';
+const WS = new RegExp(`[${WS_CHARS}]`);
+// Characters that a text shows as nothing or as an empty space: soft hyphen, combining grapheme joiner,
+// Hangul fillers, Khmer vowel inherents, Mongolian selectors and vowel separator, zero-width characters,
+// invisible operators, deprecated format characters, variation selectors, Braille blank. A fixed list.
+const INVISIBLE_CHARS = '\\u00ad\\u034f\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200d\\u2060-\\u2064\\u206a-\\u206f\\u2800\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0';
+const VISIBLE = new RegExp(`[^${WS_CHARS}${INVISIBLE_CHARS}]`);
+// Invisible characters outside the BMP, as UTF-16 surrogate pairs (no "u" flag, so no Unicode tables):
+// tag characters U+E0000-U+E007F, variation selectors supplement U+E0100-U+E01EF,
+// musical format characters U+1D173-U+1D17A, shorthand format controls U+1BCA0-U+1BCA3.
+const INVISIBLE_ASTRAL = /\uDB40[\uDC00-\uDC7F\uDD00-\uDDEF]|\uD834[\uDD73-\uDD7A]|\uD82F[\uDCA0-\uDCA3]/g;
+
+/** True if `s` has at least 1 character that is not white space and not invisible (fixed lists, no Unicode tables). */
+export const hasVisibleChar = (s: string): boolean => VISIBLE.test(s.replace(INVISIBLE_ASTRAL, ''));
+
+/**
+ * True if `name` is a valid display name (of a key file or an enrollment request): 1 to 200
+ * characters, no control and no bidirectional format characters (the single-line text rule), and at
+ * least 1 visible character (hasVisibleChar). An admin sees this name, so it must not look different
+ * from its content.
+ */
+export const isValidDisplayName = (name: unknown): name is string =>
+  typeof name === 'string' && checkValue(name, { text: 200, min: 1 }, 'displayName') === null && hasVisibleChar(name);
+
+const SCHEME_RE = /^([A-Za-z][A-Za-z0-9+.-]*):/;
+/** The WHATWG special schemes that have a host. "file" is special too, but its host can be empty. */
+const HOST_SCHEMES: readonly string[] = ['http', 'https', 'ws', 'wss', 'ftp'];
+/** ASCII-only lower case. String.prototype.toLowerCase also maps non-ASCII letters. */
+const asciiLower = (s: string): string => s.replace(/[A-Z]+/g, (c) => c.toLowerCase());
+// The authority of a special URL: after 0 or more "/" or "\", up to "/", "\", "?" or "#" (WHATWG reads "\" as "/").
+const AUTHORITY_RE = /^[/\\]*([^/\\?#]*)/;
+// The text of an IPv6 address has only hex digits, ":" and "." (an IPv4 end). The caller also
+// requires 1 ":". This form has no nested quantifier, so its time is linear.
+const IPV6_RE = /^\[[0-9A-Fa-f:.]*\]$/;
+// ASCII characters that WHATWG never permits in a host (forbidden host code points). Percent
+// decoding and IDNA mapping do not remove an ASCII character, so a host with 1 of them always fails.
+const HOST_BAD = /[<>^|[\]]/;
+
+/**
+ * True if `v` is an absolute URL with one of the schemes (for example ['https:', 'mailto:']).
+ *
+ * The replay calls this function, so it must give the same result on all clients. It does not use
+ * the URL class, Intl or normalize(): URL parsers and their IDNA tables differ between browser
+ * engines and versions. It uses only fixed regular expressions with linear time on UTF-16 code units.
+ *
+ * Rules:
+ * - No control character, no bidirectional format character (CTRL_SL), no white space.
+ * - A scheme `[A-Za-z][A-Za-z0-9+.-]*:`. The comparison with `schemes` is ASCII case-insensitive.
+ * - http, https, ws, wss, ftp: 0 or more "/" or "\", then an authority up to "/", "\", "?" or "#".
+ *   The authority is [userinfo "@"] host [":" port]. The last "@" ends the userinfo. The host is not
+ *   empty. An IPv6 host is "[...]". The port has only digits and is at most 65535 (it can be empty).
+ * - file: and other schemes (for example mailto:): no more rules. The rest can be empty ("mailto:").
+ *
+ * Deliberate differences from WHATWG:
+ * - WHATWG removes leading and trailing spaces and controls, removes tabs and line breaks, and
+ *   percent-encodes other spaces in a path. This check refuses these characters at all positions.
+ *   (The old check, with the URL class, refused them too.)
+ * - The check accepts a superset of the other WHATWG URLs:
+ *   - It does not do IDNA, percent decoding of the host, or IPv4 parsing. Thus it accepts some hosts
+ *     that WHATWG refuses (for example "http://%zz/", "http://a.123/", "http://xn--a/").
+ *   - It accepts any IPv6 text of hex digits, ":" and "." (for example "http://[1:::::2]/").
+ *   - It accepts any text after the authority, any text after "file:" and after a non-special scheme.
+ */
 export function isUrl(v: unknown, schemes: readonly string[]): v is string {
-  if (typeof v !== 'string' || CTRL_SL.test(v) || /\s/.test(v)) return false;
-  let u: URL;
-  try {
-    u = new URL(v);
-  } catch {
-    return false;
+  if (typeof v !== 'string' || CTRL_SL.test(v) || WS.test(v)) return false;
+  const m = SCHEME_RE.exec(v);
+  if (!m) return false;
+  const scheme = asciiLower(m[1]);
+  if (!schemes.some((s) => asciiLower(s) === scheme + ':')) return false;
+  if (!HOST_SCHEMES.includes(scheme)) return true;
+  const auth = AUTHORITY_RE.exec(v.slice(m[0].length))![1];
+  const hostPort = auth.slice(auth.lastIndexOf('@') + 1);
+  let host: string;
+  let port: string;
+  if (hostPort.startsWith('[')) {
+    const end = hostPort.indexOf(']') + 1;
+    host = hostPort.slice(0, end);
+    const after = hostPort.slice(end);
+    if (end === 0 || !IPV6_RE.test(host) || !host.includes(':') || (after !== '' && after[0] !== ':')) return false;
+    port = after.slice(1);
+  } else {
+    const c = hostPort.indexOf(':');
+    host = c < 0 ? hostPort : hostPort.slice(0, c);
+    port = c < 0 ? '' : hostPort.slice(c + 1);
+    if (host === '' || HOST_BAD.test(host)) return false;
   }
-  return schemes.includes(u.protocol);
+  if (!/^[0-9]*$/.test(port)) return false;
+  const digits = port.replace(/^0+/, '');
+  return digits.length <= 5 && Number(digits || '0') <= 65535;
 }
 
 export function checkValue(v: unknown, t: FieldType, path: string): string | null {
@@ -146,7 +227,8 @@ export function checkObject(v: unknown, schema: Schema, path = 'payload', exact 
     const optional = rawKey.endsWith('?');
     const key = optional ? rawKey.slice(0, -1) : rawKey;
     allowed.add(key);
-    if (!(key in v)) {
+    // Object.hasOwn: an inherited name (for example "constructor") is not a field of the payload.
+    if (!Object.hasOwn(v, key)) {
       if (optional) continue;
       return `${path}.${key}: missing`;
     }
